@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>Avalonia.Skia.RenderTests</AssemblyName>
+    <RootNamespace>Avalonia.Skia.RenderTests</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <ImplicitUsings>false</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <DefineConstants>$(DefineConstants);AVALONIA_SKIA;SKIANATIVE_AVALONIA</DefineConstants>
+    <SignAssembly Condition="'$(AvaloniaSourceRoot)' != ''">true</SignAssembly>
+    <AssemblyOriginatorKeyFile Condition="'$(AvaloniaSourceRoot)' != ''">$(AvaloniaSourceRoot)/build/avalonia.snk</AssemblyOriginatorKeyFile>
+    <AvaloniaAccessUnstablePrivateApis>true</AvaloniaAccessUnstablePrivateApis>
+    <Avalonia_I_Want_To_Use_Private_Apis_In_Nuget_Package_And_Promise_To_Pin_The_Exact_Avalonia_Version_In_Package_Dependency>true</Avalonia_I_Want_To_Use_Private_Apis_In_Nuget_Package_And_Promise_To_Pin_The_Exact_Avalonia_Version_In_Package_Dependency>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(AvaloniaSourceRoot)' != ''">
+    <Compile Include="$(AvaloniaSourceRoot)/tests/Avalonia.RenderTests/**/*.cs"
+             Exclude="$(AvaloniaSourceRoot)/tests/Avalonia.RenderTests/TestBase.cs;$(AvaloniaSourceRoot)/tests/Avalonia.RenderTests/TestRenderHelper.cs;$(AvaloniaSourceRoot)/tests/Avalonia.RenderTests/Composition/DirectFbCompositionTests.cs;$(AvaloniaSourceRoot)/tests/Avalonia.RenderTests/Properties/AssemblyInfo.cs"
+             LinkBase="Avalonia.RenderTests" />
+    <EmbeddedResource Include="$(AvaloniaSourceRoot)/tests/Avalonia.RenderTests/Assets/*.ttf" Link="Assets/%(Filename)%(Extension)" />
+    <Content Include="$(AvaloniaSourceRoot)/tests/Avalonia.RenderTests/Assets/*.*" Link="Assets/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(AvaloniaSourceRoot)' != ''">
+    <ProjectReference Include="../../src/SkiaNative.Avalonia/SkiaNative.Avalonia.csproj" />
+    <ProjectReference Include="$(AvaloniaSourceRoot)/src/Avalonia.Base/Avalonia.Base.csproj" />
+    <ProjectReference Include="$(AvaloniaSourceRoot)/src/Avalonia.Controls/Avalonia.Controls.csproj" />
+    <ProjectReference Include="$(AvaloniaSourceRoot)/src/Markup/Avalonia.Markup/Avalonia.Markup.csproj" />
+    <ProjectReference Include="$(AvaloniaSourceRoot)/src/Markup/Avalonia.Markup.Xaml/Avalonia.Markup.Xaml.csproj" />
+    <ProjectReference Include="$(AvaloniaSourceRoot)/src/Avalonia.Themes.Simple/Avalonia.Themes.Simple.csproj" />
+    <ProjectReference Include="$(AvaloniaSourceRoot)/src/HarfBuzz/Avalonia.HarfBuzz/Avalonia.HarfBuzz.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="SixLabors.ImageSharp" />
+    <PackageReference Include="System.Reactive" />
+    <PackageReference Include="xunit.v3" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+  </ItemGroup>
+</Project>
