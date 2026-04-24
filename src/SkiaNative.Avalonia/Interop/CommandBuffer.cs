@@ -24,15 +24,19 @@ internal sealed class CommandBuffer : IDisposable
     private NativeCommand[] _commands;
     private int _commandCount;
     private bool _disposed;
-    private readonly List<SafeHandle> _resources = new();
-    private readonly List<NativeShaderHandle> _ownedShaders = new();
-    private readonly List<NativeStrokeHandle> _ownedStrokes = new();
-    private readonly List<NativePathHandle> _ownedPaths = new();
+    private readonly PooledReferenceList<SafeHandle> _resources;
+    private readonly PooledReferenceList<NativeShaderHandle> _ownedShaders;
+    private readonly PooledReferenceList<NativeStrokeHandle> _ownedStrokes;
+    private readonly PooledReferenceList<NativePathHandle> _ownedPaths;
     private readonly Stack<bool> _opacityMaskLayers = new();
 
     public CommandBuffer(int capacity)
     {
         _commands = ArrayPool<NativeCommand>.Shared.Rent(Math.Max(capacity, 16));
+        _resources = new PooledReferenceList<SafeHandle>(Math.Min(Math.Max(capacity, 16), 256));
+        _ownedShaders = new PooledReferenceList<NativeShaderHandle>();
+        _ownedStrokes = new PooledReferenceList<NativeStrokeHandle>();
+        _ownedPaths = new PooledReferenceList<NativePathHandle>();
     }
 
     public int CommandCount => _commandCount;
@@ -736,6 +740,10 @@ internal sealed class CommandBuffer : IDisposable
         Clear();
         ArrayPool<NativeCommand>.Shared.Return(_commands);
         _commands = [];
+        _resources.Dispose();
+        _ownedShaders.Dispose();
+        _ownedStrokes.Dispose();
+        _ownedPaths.Dispose();
         _disposed = true;
     }
 
@@ -743,19 +751,19 @@ internal sealed class CommandBuffer : IDisposable
     {
         _commandCount = 0;
         _resources.Clear();
-        foreach (var shader in _ownedShaders)
+        for (var i = 0; i < _ownedShaders.Count; i++)
         {
-            shader.Dispose();
+            _ownedShaders[i].Dispose();
         }
         _ownedShaders.Clear();
-        foreach (var stroke in _ownedStrokes)
+        for (var i = 0; i < _ownedStrokes.Count; i++)
         {
-            stroke.Dispose();
+            _ownedStrokes[i].Dispose();
         }
         _ownedStrokes.Clear();
-        foreach (var path in _ownedPaths)
+        for (var i = 0; i < _ownedPaths.Count; i++)
         {
-            path.Dispose();
+            _ownedPaths[i].Dispose();
         }
         _ownedPaths.Clear();
     }
