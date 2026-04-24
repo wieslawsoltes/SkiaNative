@@ -700,7 +700,10 @@ internal sealed class CommandBuffer : IDisposable
         }
 
         _resources.Add(paint.Shader);
-        _ownedShaders.Add(paint.Shader);
+        if (paint.OwnsShader)
+        {
+            _ownedShaders.Add(paint.Shader);
+        }
     }
 
     public unsafe CommandBufferFlushResult Flush(NativeSessionHandle session)
@@ -830,14 +833,16 @@ internal static class NativeConversions
 
 internal readonly struct NativePaintSource
 {
-    public NativePaintSource(NativeColor color, NativeShaderHandle? shader = null)
+    public NativePaintSource(NativeColor color, NativeShaderHandle? shader = null, bool ownsShader = true)
     {
         Color = color;
         Shader = shader;
+        OwnsShader = ownsShader;
         HasPaint = color.A > 0 || shader is not null;
     }
 
     public bool HasPaint { get; }
+    public bool OwnsShader { get; }
     public NativeColor Color { get; }
     public NativeShaderHandle? Shader { get; }
     public nint ShaderHandle => Shader is null ? 0 : Shader.DangerousGetHandle();
@@ -949,6 +954,269 @@ internal static class NativeStrokeCache
             }
 
             return hash.ToHashCode();
+        }
+    }
+}
+
+internal static unsafe class NativeShaderCache
+{
+    private static readonly ConcurrentDictionary<GradientShaderKey, NativeShaderHandle> s_gradientCache = new(new GradientShaderKeyComparer());
+
+    public static NativeShaderHandle GetLinear(
+        float x0,
+        float y0,
+        float x1,
+        float y1,
+        NativeGradientStop[] stops,
+        NativeGradientSpreadMethod spreadMethod,
+        bool hasLocalMatrix,
+        NativeMatrix localMatrix)
+    {
+        var key = new GradientShaderKey(
+            GradientShaderKind.Linear,
+            x0,
+            y0,
+            x1,
+            y1,
+            0,
+            0,
+            spreadMethod,
+            hasLocalMatrix,
+            localMatrix,
+            stops);
+        return GetOrCreate(key);
+    }
+
+    public static NativeShaderHandle GetRadial(
+        float centerX,
+        float centerY,
+        float originX,
+        float originY,
+        float radius,
+        NativeGradientStop[] stops,
+        NativeGradientSpreadMethod spreadMethod,
+        bool hasLocalMatrix,
+        NativeMatrix localMatrix)
+    {
+        var key = new GradientShaderKey(
+            GradientShaderKind.Radial,
+            centerX,
+            centerY,
+            originX,
+            originY,
+            radius,
+            0,
+            spreadMethod,
+            hasLocalMatrix,
+            localMatrix,
+            stops);
+        return GetOrCreate(key);
+    }
+
+    public static NativeShaderHandle GetSweep(
+        float centerX,
+        float centerY,
+        NativeGradientStop[] stops,
+        NativeGradientSpreadMethod spreadMethod,
+        bool hasLocalMatrix,
+        NativeMatrix localMatrix)
+    {
+        var key = new GradientShaderKey(
+            GradientShaderKind.Sweep,
+            centerX,
+            centerY,
+            0,
+            0,
+            0,
+            0,
+            spreadMethod,
+            hasLocalMatrix,
+            localMatrix,
+            stops);
+        return GetOrCreate(key);
+    }
+
+    private static NativeShaderHandle GetOrCreate(GradientShaderKey key)
+    {
+        if (s_gradientCache.TryGetValue(key, out var cached) && !cached.IsInvalid)
+        {
+            return cached;
+        }
+
+        var created = CreateShader(key);
+        if (created.IsInvalid)
+        {
+            return created;
+        }
+
+        cached = s_gradientCache.GetOrAdd(key, created);
+        if (!ReferenceEquals(cached, created))
+        {
+            created.Dispose();
+        }
+
+        return cached;
+    }
+
+    private static NativeShaderHandle CreateShader(GradientShaderKey key)
+    {
+        fixed (NativeGradientStop* ptr = key.Stops)
+        {
+            var matrix = key.LocalMatrix;
+            var matrixPtr = key.HasLocalMatrix ? &matrix : null;
+            return key.Kind switch
+            {
+                GradientShaderKind.Linear when key.HasLocalMatrix => NativeMethods.ShaderCreateLinearWithMatrix(
+                    key.A,
+                    key.B,
+                    key.C,
+                    key.D,
+                    ptr,
+                    key.Stops.Length,
+                    key.SpreadMethod,
+                    matrixPtr),
+                GradientShaderKind.Linear => NativeMethods.ShaderCreateLinear(
+                    key.A,
+                    key.B,
+                    key.C,
+                    key.D,
+                    ptr,
+                    key.Stops.Length,
+                    key.SpreadMethod),
+                GradientShaderKind.Radial when key.HasLocalMatrix => NativeMethods.ShaderCreateRadialWithMatrix(
+                    key.A,
+                    key.B,
+                    key.C,
+                    key.D,
+                    key.E,
+                    ptr,
+                    key.Stops.Length,
+                    key.SpreadMethod,
+                    matrixPtr),
+                GradientShaderKind.Radial => NativeMethods.ShaderCreateRadial(
+                    key.A,
+                    key.B,
+                    key.C,
+                    key.D,
+                    key.E,
+                    ptr,
+                    key.Stops.Length,
+                    key.SpreadMethod),
+                GradientShaderKind.Sweep => NativeMethods.ShaderCreateSweep(
+                    key.A,
+                    key.B,
+                    ptr,
+                    key.Stops.Length,
+                    key.SpreadMethod,
+                    matrixPtr),
+                _ => throw new InvalidOperationException("Unknown native gradient shader kind.")
+            };
+        }
+    }
+
+    private enum GradientShaderKind
+    {
+        Linear,
+        Radial,
+        Sweep
+    }
+
+    private readonly record struct GradientShaderKey(
+        GradientShaderKind Kind,
+        float A,
+        float B,
+        float C,
+        float D,
+        float E,
+        float F,
+        NativeGradientSpreadMethod SpreadMethod,
+        bool HasLocalMatrix,
+        NativeMatrix LocalMatrix,
+        NativeGradientStop[] Stops);
+
+    private sealed class GradientShaderKeyComparer : IEqualityComparer<GradientShaderKey>
+    {
+        public bool Equals(GradientShaderKey x, GradientShaderKey y)
+        {
+            if (x.Kind != y.Kind ||
+                x.A != y.A ||
+                x.B != y.B ||
+                x.C != y.C ||
+                x.D != y.D ||
+                x.E != y.E ||
+                x.F != y.F ||
+                x.SpreadMethod != y.SpreadMethod ||
+                x.HasLocalMatrix != y.HasLocalMatrix ||
+                !Equals(x.LocalMatrix, y.LocalMatrix) ||
+                x.Stops.Length != y.Stops.Length)
+            {
+                return false;
+            }
+
+            for (var i = 0; i < x.Stops.Length; i++)
+            {
+                if (x.Stops[i].Offset != y.Stops[i].Offset ||
+                    !Equals(x.Stops[i].Color, y.Stops[i].Color))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        public int GetHashCode(GradientShaderKey key)
+        {
+            var hash = new HashCode();
+            hash.Add(key.Kind);
+            hash.Add(key.A);
+            hash.Add(key.B);
+            hash.Add(key.C);
+            hash.Add(key.D);
+            hash.Add(key.E);
+            hash.Add(key.F);
+            hash.Add(key.SpreadMethod);
+            hash.Add(key.HasLocalMatrix);
+            Add(ref hash, key.LocalMatrix);
+            foreach (var stop in key.Stops)
+            {
+                hash.Add(stop.Offset);
+                Add(ref hash, stop.Color);
+            }
+
+            return hash.ToHashCode();
+        }
+
+        private static bool Equals(NativeMatrix x, NativeMatrix y) =>
+            x.M11 == y.M11 &&
+            x.M12 == y.M12 &&
+            x.M21 == y.M21 &&
+            x.M22 == y.M22 &&
+            x.M31 == y.M31 &&
+            x.M32 == y.M32;
+
+        private static bool Equals(NativeColor x, NativeColor y) =>
+            x.R == y.R &&
+            x.G == y.G &&
+            x.B == y.B &&
+            x.A == y.A;
+
+        private static void Add(ref HashCode hash, NativeMatrix matrix)
+        {
+            hash.Add(matrix.M11);
+            hash.Add(matrix.M12);
+            hash.Add(matrix.M21);
+            hash.Add(matrix.M22);
+            hash.Add(matrix.M31);
+            hash.Add(matrix.M32);
+        }
+
+        private static void Add(ref HashCode hash, NativeColor color)
+        {
+            hash.Add(color.R);
+            hash.Add(color.G);
+            hash.Add(color.B);
+            hash.Add(color.A);
         }
     }
 }
@@ -1136,36 +1404,24 @@ internal static unsafe class BrushUtil
         var start = brush.StartPoint.ToPixels(bounds);
         var end = brush.EndPoint.ToPixels(bounds);
         var hasLocalMatrix = TryCreateBrushLocalMatrix(brush, bounds, out var localMatrix);
-        fixed (NativeGradientStop* ptr = stops)
+        var shader = NativeShaderCache.GetLinear(
+            (float)start.X,
+            (float)start.Y,
+            (float)end.X,
+            (float)end.Y,
+            stops,
+            ToNativeSpread(brush.SpreadMethod),
+            hasLocalMatrix,
+            localMatrix);
+
+        if (shader.IsInvalid)
         {
-            var shader = hasLocalMatrix
-                ? NativeMethods.ShaderCreateLinearWithMatrix(
-                    (float)start.X,
-                    (float)start.Y,
-                    (float)end.X,
-                    (float)end.Y,
-                    ptr,
-                    stops.Length,
-                    ToNativeSpread(brush.SpreadMethod),
-                    &localMatrix)
-                : NativeMethods.ShaderCreateLinear(
-                    (float)start.X,
-                    (float)start.Y,
-                    (float)end.X,
-                    (float)end.Y,
-                    ptr,
-                    stops.Length,
-                    ToNativeSpread(brush.SpreadMethod));
-
-            if (shader.IsInvalid)
-            {
-                shader.Dispose();
-                return false;
-            }
-
-            paint = new NativePaintSource(new NativeColor(1, 1, 1, 1), shader);
-            return true;
+            shader.Dispose();
+            return false;
         }
+
+        paint = new NativePaintSource(new NativeColor(1, 1, 1, 1), shader, ownsShader: false);
+        return true;
     }
 
     private static bool TryCreateRadialGradientPaint(IRadialGradientBrush brush, Rect bounds, out NativePaintSource paint)
@@ -1209,38 +1465,25 @@ internal static unsafe class BrushUtil
         var hasLocalMatrix = !localMatrix.IsIdentity;
         var nativeLocalMatrix = localMatrix.ToNative();
 
-        fixed (NativeGradientStop* ptr = stops)
+        var shader = NativeShaderCache.GetRadial(
+            (float)center.X,
+            (float)center.Y,
+            (float)origin.X,
+            (float)origin.Y,
+            (float)radiusX,
+            stops,
+            ToNativeSpread(brush.SpreadMethod),
+            hasLocalMatrix,
+            nativeLocalMatrix);
+
+        if (shader.IsInvalid)
         {
-            var shader = hasLocalMatrix
-                ? NativeMethods.ShaderCreateRadialWithMatrix(
-                    (float)center.X,
-                    (float)center.Y,
-                    (float)origin.X,
-                    (float)origin.Y,
-                    (float)radiusX,
-                    ptr,
-                    stops.Length,
-                    ToNativeSpread(brush.SpreadMethod),
-                    &nativeLocalMatrix)
-                : NativeMethods.ShaderCreateRadial(
-                    (float)center.X,
-                    (float)center.Y,
-                    (float)origin.X,
-                    (float)origin.Y,
-                    (float)radiusX,
-                    ptr,
-                    stops.Length,
-                    ToNativeSpread(brush.SpreadMethod));
-
-            if (shader.IsInvalid)
-            {
-                shader.Dispose();
-                return false;
-            }
-
-            paint = new NativePaintSource(new NativeColor(1, 1, 1, 1), shader);
-            return true;
+            shader.Dispose();
+            return false;
         }
+
+        paint = new NativePaintSource(new NativeColor(1, 1, 1, 1), shader, ownsShader: false);
+        return true;
     }
 
     private static bool TryCreateConicGradientPaint(IConicGradientBrush brush, Rect bounds, out NativePaintSource paint)
@@ -1261,25 +1504,22 @@ internal static unsafe class BrushUtil
         }
 
         var nativeLocalMatrix = localMatrix.ToNative();
-        fixed (NativeGradientStop* ptr = stops)
+        var shader = NativeShaderCache.GetSweep(
+            (float)center.X,
+            (float)center.Y,
+            stops,
+            ToNativeSpread(brush.SpreadMethod),
+            hasLocalMatrix: true,
+            nativeLocalMatrix);
+
+        if (shader.IsInvalid)
         {
-            var shader = NativeMethods.ShaderCreateSweep(
-                (float)center.X,
-                (float)center.Y,
-                ptr,
-                stops.Length,
-                ToNativeSpread(brush.SpreadMethod),
-                &nativeLocalMatrix);
-
-            if (shader.IsInvalid)
-            {
-                shader.Dispose();
-                return false;
-            }
-
-            paint = new NativePaintSource(new NativeColor(1, 1, 1, 1), shader);
-            return true;
+            shader.Dispose();
+            return false;
         }
+
+        paint = new NativePaintSource(new NativeColor(1, 1, 1, 1), shader, ownsShader: false);
+        return true;
     }
 
     private static bool TryCreateImageBrushPaint(IImageBrush brush, Rect bounds, out NativePaintSource paint)
@@ -1468,51 +1708,69 @@ internal static unsafe class BrushUtil
 
     private static NativeGradientStop[] CreateStops(IGradientBrush brush)
     {
-        if (brush.GradientStops.Count == 0)
+        var count = brush.GradientStops.Count;
+        if (count == 0)
         {
             return [];
         }
 
-        var stops = brush.GradientStops
-            .Select(x => new
+        var stops = new NativeGradientStop[count];
+        for (var i = 0; i < count; i++)
+        {
+            var stop = brush.GradientStops[i];
+            stops[i] = new NativeGradientStop
             {
-                Offset = (float)Math.Clamp(x.Offset, 0, 1),
-                Color = ToNativeColor(x.Color, brush.Opacity)
-            })
-            .OrderBy(x => x.Offset)
-            .ToList();
+                Offset = (float)Math.Clamp(stop.Offset, 0, 1),
+                Color = ToNativeColor(stop.Color, brush.Opacity)
+            };
+        }
 
-        var normalized = new List<NativeGradientStop>(Math.Max(stops.Count, 2));
+        Array.Sort(stops, static (left, right) => left.Offset.CompareTo(right.Offset));
+
+        var writeIndex = 0;
         var lastOffset = -1f;
         foreach (var stop in stops)
         {
             var offset = stop.Offset;
-            if (normalized.Count > 0 && offset <= lastOffset)
+            if (writeIndex > 0 && offset <= lastOffset)
             {
                 offset = Math.Min(1, lastOffset + DuplicateStopEpsilon);
             }
 
-            if (normalized.Count > 0 && offset <= lastOffset)
+            if (writeIndex > 0 && offset <= lastOffset)
             {
                 continue;
             }
 
-            normalized.Add(new NativeGradientStop
+            stops[writeIndex++] = new NativeGradientStop
             {
                 Offset = offset,
                 Color = stop.Color
-            });
+            };
             lastOffset = offset;
         }
 
-        if (normalized.Count == 1)
+        if (writeIndex == 0)
         {
-            var only = normalized[0];
-            normalized[0] = new NativeGradientStop { Offset = 0, Color = only.Color };
-            normalized.Add(new NativeGradientStop { Offset = 1, Color = only.Color });
+            return [];
         }
 
-        return normalized.ToArray();
+        if (writeIndex == 1)
+        {
+            var only = stops[0];
+            return
+            [
+                new NativeGradientStop { Offset = 0, Color = only.Color },
+                new NativeGradientStop { Offset = 1, Color = only.Color }
+            ];
+        }
+
+        if (writeIndex == stops.Length)
+        {
+            return stops;
+        }
+
+        return stops.AsSpan(0, writeIndex).ToArray();
     }
 
     private static NativeColor ToNativeColor(Color color, double opacity) => new(

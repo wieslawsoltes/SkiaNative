@@ -207,9 +207,11 @@ public sealed class AbiTests
         Assert.NotNull(radialPaint.Shader);
         Assert.False(linearPaint.Shader.IsInvalid);
         Assert.False(radialPaint.Shader.IsInvalid);
+        Assert.False(linearPaint.OwnsShader);
+        Assert.False(radialPaint.OwnsShader);
 
-        linearPaint.Shader.Dispose();
-        radialPaint.Shader.Dispose();
+        Assert.True(BrushUtil.TryCreatePaint(linear, new Rect(0, 0, 100, 80), out var repeatedLinearPaint));
+        Assert.Same(linearPaint.Shader, repeatedLinearPaint.Shader);
     }
 
     [Fact]
