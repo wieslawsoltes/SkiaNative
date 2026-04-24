@@ -1,0 +1,182 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  AVALONIA_REPOSITORY: https://github.com/wieslawsoltes/Avalonia.git
+  AVALONIA_REF: 1060839683d2f8bb1b752d5bc021a53f90a0129d
+  AvaloniaSourceRoot: ${{ github.workspace }}/../Avalonia
+
+jobs:
+  managed:
+    name: Managed build and unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Checkout Avalonia source
+        run: ./.github/scripts/checkout-avalonia.sh
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          global-json-file: global.json
+
+      - name: Restore
+        run: dotnet restore SkiaNative.Avalonia.slnx /p:AvaloniaSourceRoot="$AvaloniaSourceRoot"
+
+      - name: Build
+        run: dotnet build SkiaNative.Avalonia.slnx -c Release --no-restore /p:AvaloniaSourceRoot="$AvaloniaSourceRoot" /p:ContinuousIntegrationBuild=true
+
+      - name: Unit tests
+        run: dotnet test --project tests/SkiaNative.Avalonia.Tests/SkiaNative.Avalonia.Tests.csproj -c Release --no-build
+
+      - name: Pack managed package shape
+        run: dotnet pack src/SkiaNative.Avalonia/SkiaNative.Avalonia.csproj -c Release --no-build -o artifacts/packages /p:AvaloniaSourceRoot="$AvaloniaSourceRoot" /p:ContinuousIntegrationBuild=true
+
+      - name: Upload managed package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: managed-package-no-native-assets
+          path: artifacts/packages/*.nupkg
+          if-no-files-found: error
+
+  native-macos:
+    name: Native macOS ${{ matrix.rid }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: osx-arm64
+            runner: macos-14
+          - rid: osx-x64
+            runner: macos-15-intel
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          global-json-file: global.json
+
+      - name: Verify native build tools
+        run: |
+          cmake --version
+          if ! command -v ninja >/dev/null 2>&1; then
+            brew update
+            brew install ninja
+          fi
+          ninja --version
+          python3 --version
+
+      - name: Build native asset
+        env:
+          SKIANATIVE_REQUIRE_FULL_SYNC_DEPS: 1
+        run: ./eng/build-native.sh ${{ matrix.rid }}
+
+      - name: Checkout Avalonia source
+        run: ./.github/scripts/checkout-avalonia.sh
+
+      - name: Restore
+        run: dotnet restore SkiaNative.Avalonia.slnx /p:AvaloniaSourceRoot="$AvaloniaSourceRoot"
+
+      - name: Build managed projects
+        run: dotnet build SkiaNative.Avalonia.slnx -c Release --no-restore /p:AvaloniaSourceRoot="$AvaloniaSourceRoot" /p:ContinuousIntegrationBuild=true
+
+      - name: Unit tests with native dylib
+        run: dotnet test --project tests/SkiaNative.Avalonia.Tests/SkiaNative.Avalonia.Tests.csproj -c Release --no-build
+
+      - name: Targeted render tests with native dylib
+        run: dotnet test --project tests/SkiaNative.Avalonia.RenderTests/SkiaNative.Avalonia.RenderTests.csproj -c Release --no-build -- --filter-class '*DirectFbCompositionTests'
+
+      - name: Upload native dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.rid }}
+          path: artifacts/native/${{ matrix.rid }}/libSkiaNativeAvalonia.dylib
+          if-no-files-found: error
+
+  package:
+    name: Package with native assets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    needs:
+      - managed
+      - native-macos
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Checkout Avalonia source
+        run: ./.github/scripts/checkout-avalonia.sh
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          global-json-file: global.json
+
+      - name: Download native assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: artifacts/native-download
+
+      - name: Stage native assets
+        run: |
+          set -euo pipefail
+          for rid in osx-arm64 osx-x64; do
+            mkdir -p "artifacts/native/$rid"
+            cp "artifacts/native-download/native-$rid/libSkiaNativeAvalonia.dylib" "artifacts/native/$rid/libSkiaNativeAvalonia.dylib"
+          done
+          find artifacts/native -maxdepth 3 -type f -print
+
+      - name: Restore package project
+        run: dotnet restore src/SkiaNative.Avalonia/SkiaNative.Avalonia.csproj /p:AvaloniaSourceRoot="$AvaloniaSourceRoot"
+
+      - name: Pack
+        run: dotnet pack src/SkiaNative.Avalonia/SkiaNative.Avalonia.csproj -c Release --no-restore -o artifacts/packages /p:AvaloniaSourceRoot="$AvaloniaSourceRoot" /p:ContinuousIntegrationBuild=true
+
+      - name: Verify package contents
+        run: |
+          set -euo pipefail
+          package="$(find artifacts/packages -name '*.nupkg' | head -n 1)"
+          unzip -l "$package" | tee artifacts/package-contents.txt
+          grep -q 'runtimes/osx-arm64/native/libSkiaNativeAvalonia.dylib' artifacts/package-contents.txt
+          grep -q 'runtimes/osx-x64/native/libSkiaNativeAvalonia.dylib' artifacts/package-contents.txt
+          grep -q 'lib/net10.0/SkiaNative.Avalonia.dll' artifacts/package-contents.txt
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: skianative-avalonia-ci-package
+          path: |
+            artifacts/packages/*.nupkg
+            artifacts/package-contents.txt
+          if-no-files-found: error

@@ -1,0 +1,230 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Package version. If omitted, uses 0.0.0-ci.<run_number>.
+        required: false
+        type: string
+      create_github_release:
+        description: Create or update a GitHub Release.
+        required: true
+        default: true
+        type: boolean
+      publish_nuget:
+        description: Push the package to nuget.org when NUGET_API_KEY is configured.
+        required: true
+        default: false
+        type: boolean
+      prerelease:
+        description: Mark the GitHub Release as prerelease.
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  AVALONIA_REPOSITORY: https://github.com/wieslawsoltes/Avalonia.git
+  AVALONIA_REF: 1060839683d2f8bb1b752d5bc021a53f90a0129d
+  AvaloniaSourceRoot: ${{ github.workspace }}/../Avalonia
+
+jobs:
+  native-macos:
+    name: Build native ${{ matrix.rid }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: osx-arm64
+            runner: macos-14
+          - rid: osx-x64
+            runner: macos-15-intel
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Verify native build tools
+        run: |
+          cmake --version
+          if ! command -v ninja >/dev/null 2>&1; then
+            brew update
+            brew install ninja
+          fi
+          ninja --version
+          python3 --version
+
+      - name: Build native asset
+        env:
+          SKIANATIVE_REQUIRE_FULL_SYNC_DEPS: 1
+        run: ./eng/build-native.sh ${{ matrix.rid }}
+
+      - name: Upload native dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.rid }}
+          path: artifacts/native/${{ matrix.rid }}/libSkiaNativeAvalonia.dylib
+          if-no-files-found: error
+
+  pack:
+    name: Pack and publish release artifacts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    needs:
+      - native-macos
+    env:
+      INPUT_VERSION: ${{ inputs.version }}
+      INPUT_CREATE_GITHUB_RELEASE: ${{ inputs.create_github_release }}
+      INPUT_PUBLISH_NUGET: ${{ inputs.publish_nuget }}
+      INPUT_PRERELEASE: ${{ inputs.prerelease }}
+      NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Checkout Avalonia source
+        run: ./.github/scripts/checkout-avalonia.sh
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          global-json-file: global.json
+
+      - name: Resolve release version
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            tag="$GITHUB_REF_NAME"
+            version="${tag#v}"
+            create_release="true"
+            prerelease="${INPUT_PRERELEASE:-false}"
+            publish_nuget="true"
+          else
+            version="${INPUT_VERSION:-}"
+            if [ -z "$version" ]; then
+              version="0.0.0-ci.${GITHUB_RUN_NUMBER}"
+            fi
+            tag="v$version"
+            create_release="${INPUT_CREATE_GITHUB_RELEASE:-true}"
+            prerelease="${INPUT_PRERELEASE:-false}"
+            publish_nuget="${INPUT_PUBLISH_NUGET:-false}"
+          fi
+
+          {
+            echo "RELEASE_VERSION=$version"
+            echo "RELEASE_TAG=$tag"
+            echo "CREATE_GITHUB_RELEASE=$create_release"
+            echo "RELEASE_PRERELEASE=$prerelease"
+            echo "PUBLISH_NUGET=$publish_nuget"
+          } >> "$GITHUB_ENV"
+          echo "Resolved release version: $version ($tag)"
+
+      - name: Download native assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: artifacts/native-download
+
+      - name: Stage native assets
+        run: |
+          set -euo pipefail
+          for rid in osx-arm64 osx-x64; do
+            mkdir -p "artifacts/native/$rid"
+            cp "artifacts/native-download/native-$rid/libSkiaNativeAvalonia.dylib" "artifacts/native/$rid/libSkiaNativeAvalonia.dylib"
+          done
+          find artifacts/native -maxdepth 3 -type f -print
+
+      - name: Restore
+        run: dotnet restore src/SkiaNative.Avalonia/SkiaNative.Avalonia.csproj /p:AvaloniaSourceRoot="$AvaloniaSourceRoot"
+
+      - name: Pack
+        run: >-
+          dotnet pack src/SkiaNative.Avalonia/SkiaNative.Avalonia.csproj
+          -c Release
+          --no-restore
+          -o artifacts/packages
+          /p:AvaloniaSourceRoot="$AvaloniaSourceRoot"
+          /p:PackageVersion="$RELEASE_VERSION"
+          /p:ContinuousIntegrationBuild=true
+
+      - name: Verify package contents
+        run: |
+          set -euo pipefail
+          package="$(find artifacts/packages -name '*.nupkg' | head -n 1)"
+          unzip -l "$package" | tee artifacts/package-contents.txt
+          grep -q 'runtimes/osx-arm64/native/libSkiaNativeAvalonia.dylib' artifacts/package-contents.txt
+          grep -q 'runtimes/osx-x64/native/libSkiaNativeAvalonia.dylib' artifacts/package-contents.txt
+          grep -q 'lib/net10.0/SkiaNative.Avalonia.dll' artifacts/package-contents.txt
+
+      - name: Upload release package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: skianative-avalonia-${{ env.RELEASE_VERSION }}
+          path: |
+            artifacts/packages/*.nupkg
+            artifacts/package-contents.txt
+          if-no-files-found: error
+
+      - name: Create or update GitHub Release
+        if: env.CREATE_GITHUB_RELEASE == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          prerelease_flag=()
+          if [ "$RELEASE_PRERELEASE" = "true" ]; then
+            prerelease_flag=(--prerelease)
+          fi
+
+          notes="$(cat <<NOTES
+          SkiaNative.Avalonia $RELEASE_VERSION
+
+          Native assets included:
+          - osx-arm64
+          - osx-x64
+
+          Built from commit $GITHUB_SHA.
+          NOTES
+          )"
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" artifacts/packages/*.nupkg artifacts/package-contents.txt --clobber
+          else
+            gh release create "$RELEASE_TAG" artifacts/packages/*.nupkg artifacts/package-contents.txt \
+              --target "$GITHUB_SHA" \
+              --title "SkiaNative.Avalonia $RELEASE_VERSION" \
+              --notes "$notes" \
+              "${prerelease_flag[@]}"
+          fi
+
+      - name: Publish to NuGet
+        if: env.PUBLISH_NUGET == 'true'
+        run: |
+          set -euo pipefail
+          if [ -z "${NUGET_API_KEY:-}" ]; then
+            echo "::warning::NUGET_API_KEY is not configured; skipping NuGet publish."
+            exit 0
+          fi
+
+          for package in artifacts/packages/*.nupkg; do
+            dotnet nuget push "$package" \
+              --api-key "$NUGET_API_KEY" \
+              --source https://api.nuget.org/v3/index.json \
+              --skip-duplicate
+          done
