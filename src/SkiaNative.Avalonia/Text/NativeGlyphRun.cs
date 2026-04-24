@@ -19,7 +19,9 @@ internal sealed unsafe class NativeGlyphRun : IGlyphRunImpl
 
     private readonly ushort[] _glyphIndices;
     private readonly NativeGlyphPosition[] _positions;
-    private readonly Dictionary<uint, NativeGlyphRunHandle> _nativeGlyphRuns = new();
+    private uint _primaryNativeGlyphRunOptions;
+    private NativeGlyphRunHandle? _primaryNativeGlyphRun;
+    private Dictionary<uint, NativeGlyphRunHandle>? _additionalNativeGlyphRuns;
 
     public NativeGlyphRun(GlyphTypeface glyphTypeface, double fontRenderingEmSize, IReadOnlyList<GlyphInfo> glyphInfos, Point baselineOrigin)
     {
@@ -58,12 +60,25 @@ internal sealed unsafe class NativeGlyphRun : IGlyphRunImpl
     internal NativeGlyphRunHandle GetNativeGlyphRunHandle(TextOptions textOptions, RenderOptions renderOptions)
     {
         var options = CreateTextOptions(textOptions, renderOptions);
-        if (!_nativeGlyphRuns.TryGetValue(options, out var handle))
+        if (_primaryNativeGlyphRun is null)
         {
-            _nativeGlyphRuns.Add(options, handle = CreateNativeGlyphRun(options));
+            _primaryNativeGlyphRunOptions = options;
+            _primaryNativeGlyphRun = CreateNativeGlyphRun(options);
+            return _primaryNativeGlyphRun;
         }
 
-        return handle;
+        if (options == _primaryNativeGlyphRunOptions)
+        {
+            return _primaryNativeGlyphRun;
+        }
+
+        _additionalNativeGlyphRuns ??= new Dictionary<uint, NativeGlyphRunHandle>();
+        if (!_additionalNativeGlyphRuns.TryGetValue(options, out var additional))
+        {
+            _additionalNativeGlyphRuns.Add(options, additional = CreateNativeGlyphRun(options));
+        }
+
+        return additional;
     }
 
     public IReadOnlyList<float> GetIntersections(float lowerLimit, float upperLimit)
@@ -92,12 +107,20 @@ internal sealed unsafe class NativeGlyphRun : IGlyphRunImpl
 
     public void Dispose()
     {
-        foreach (var handle in _nativeGlyphRuns.Values)
+        _primaryNativeGlyphRun?.Dispose();
+        _primaryNativeGlyphRun = null;
+
+        if (_additionalNativeGlyphRuns is null)
+        {
+            return;
+        }
+
+        foreach (var handle in _additionalNativeGlyphRuns.Values)
         {
             handle.Dispose();
         }
 
-        _nativeGlyphRuns.Clear();
+        _additionalNativeGlyphRuns.Clear();
     }
 
     private NativeGlyphRunHandle CreateNativeGlyphRun(uint textOptions)
