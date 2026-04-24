@@ -2,6 +2,7 @@
   <Project Path="src/SkiaNative.Avalonia/SkiaNative.Avalonia.csproj" />
   <Project Path="tests/SkiaNative.Avalonia.Tests/SkiaNative.Avalonia.Tests.csproj" />
   <Project Path="tests/SkiaNative.Avalonia.RenderTests/SkiaNative.Avalonia.RenderTests.csproj" />
+  <Project Path="benchmarks/SkiaNative.Avalonia.Benchmarks/SkiaNative.Avalonia.Benchmarks.csproj" />
   <Project Path="samples/SkiaNative.Avalonia.Sample/SkiaNative.Avalonia.Sample.csproj" />
   <Project Path="samples/MotionMark.SkiaNative.Avalonia/MotionMark.SkiaNative.Avalonia.csproj" />
 </Solution>

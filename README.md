@@ -200,6 +200,25 @@ This sample intentionally does not reference SkiaSharp and does not render its w
 
 ## Validation
 
+### Binding Benchmarks
+
+Run the managed/native binding microbenchmarks in Release mode:
+
+```bash
+dotnet run -c Release --project benchmarks/SkiaNative.Avalonia.Benchmarks/SkiaNative.Avalonia.Benchmarks.csproj -- --filter '*DirectPathBindingBenchmarks*'
+```
+
+The benchmark project looks for `artifacts/native/<rid>/libSkiaNativeAvalonia.dylib`. Set `SKIANATIVE_NATIVE_LIBRARY=/absolute/path/libSkiaNativeAvalonia.dylib` to override discovery.
+
+Current short-run result on Apple M3 Pro / .NET 10.0.5:
+
+| Case | 128 paths | 2048 paths |
+| --- | ---: | ---: |
+| Create native path per draw | 56.9 us | 923.5 us |
+| Reuse native path handles | 3.3 us | 54.2 us |
+
+The reusable path path is roughly 17x faster in this binding-level workload and cuts managed allocation by about 60%.
+
 ### Unit Tests
 
 ```bash
