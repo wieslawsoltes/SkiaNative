@@ -69,6 +69,12 @@ public sealed class SkiaNativeDirectCanvas : IDisposable
         _commands.SetTransform(matrix);
     }
 
+    public void ConcatTransform(Matrix matrix)
+    {
+        ThrowIfDisposed();
+        _commands.ConcatTransform(matrix);
+    }
+
     public void Clear(Color color)
     {
         ThrowIfDisposed();
@@ -152,10 +158,20 @@ public sealed class SkiaNativeDirectCanvas : IDisposable
         ReadOnlySpan<SkiaNativePathStroke> strokes,
         SkiaNativeStrokeCap cap = SkiaNativeStrokeCap.Butt,
         SkiaNativeStrokeJoin join = SkiaNativeStrokeJoin.Miter,
-        double miterLimit = 10)
+        double miterLimit = 10,
+        bool antiAlias = true) =>
+        StrokePaths(strokes, 1, cap, join, miterLimit, antiAlias);
+
+    public unsafe SkiaNativeDirectFlushResult StrokePaths(
+        ReadOnlySpan<SkiaNativePathStroke> strokes,
+        double strokeWidthScale,
+        SkiaNativeStrokeCap cap = SkiaNativeStrokeCap.Butt,
+        SkiaNativeStrokeJoin join = SkiaNativeStrokeJoin.Miter,
+        double miterLimit = 10,
+        bool antiAlias = true)
     {
         ThrowIfDisposed();
-        if (strokes.IsEmpty)
+        if (strokes.IsEmpty || strokeWidthScale <= 0 || !double.IsFinite(strokeWidthScale))
         {
             return default;
         }
@@ -174,7 +190,8 @@ public sealed class SkiaNativeDirectCanvas : IDisposable
             for (var i = 0; i < strokes.Length; i++)
             {
                 var stroke = strokes[i];
-                if (stroke.Path is null || stroke.Color.A == 0 || stroke.Width <= 0)
+                var strokeWidth = stroke.Width * strokeWidthScale;
+                if (stroke.Path is null || stroke.Color.A == 0 || strokeWidth <= 0 || !double.IsFinite(strokeWidth))
                 {
                     continue;
                 }
@@ -184,8 +201,8 @@ public sealed class SkiaNativeDirectCanvas : IDisposable
                     Path = stroke.Path.NativeHandle.DangerousGetHandle(),
                     Stroke = strokeHandle.DangerousGetHandle(),
                     Color = stroke.Color.ToNative(),
-                    StrokeThickness = (float)stroke.Width,
-                    Flags = ShapeAntiAliasFlag
+                    StrokeThickness = (float)strokeWidth,
+                    Flags = antiAlias ? ShapeAntiAliasFlag : 0
                 };
             }
 
@@ -208,6 +225,58 @@ public sealed class SkiaNativeDirectCanvas : IDisposable
         {
             ArrayPool<NativePathStrokeCommand>.Shared.Return(rented);
         }
+    }
+
+    public unsafe SkiaNativeDirectFlushResult StrokePathStream(
+        ReadOnlySpan<SkiaNativePathStreamElement> elements,
+        double strokeWidthScale,
+        SkiaNativeStrokeCap cap = SkiaNativeStrokeCap.Butt,
+        SkiaNativeStrokeJoin join = SkiaNativeStrokeJoin.Miter,
+        double miterLimit = 10,
+        bool antiAlias = true)
+    {
+        ThrowIfDisposed();
+        if (elements.IsEmpty || strokeWidthScale <= 0 || !double.IsFinite(strokeWidthScale))
+        {
+            return default;
+        }
+
+        var pending = FlushCommandBuffer();
+        var strokeHandle = NativeStrokeCache.Get((NativeStrokeCap)cap, (NativeStrokeJoin)join, miterLimit, []);
+        if (strokeHandle.IsInvalid)
+        {
+            return pending.ToDirectResult();
+        }
+
+        fixed (SkiaNativePathStreamElement* ptr = elements)
+        {
+            var stopwatch = Stopwatch.StartNew();
+            var nativeResult = NativeMethods.SessionDrawPathStream(
+                _session,
+                ptr,
+                elements.Length,
+                strokeHandle,
+                (float)strokeWidthScale,
+                antiAlias ? ShapeAntiAliasFlag : 0);
+            stopwatch.Stop();
+            var batch = new CommandBufferFlushResult(elements.Length, 1, stopwatch.Elapsed, nativeResult);
+            _reportFlush(batch);
+            return CombineFlushResults(pending, batch).ToDirectResult();
+        }
+    }
+
+    public SkiaNativeDirectFlushResult DrawPathStreamMesh(SkiaNativePathStreamMesh mesh)
+    {
+        ArgumentNullException.ThrowIfNull(mesh);
+        ThrowIfDisposed();
+
+        var pending = FlushCommandBuffer();
+        var stopwatch = Stopwatch.StartNew();
+        var nativeResult = NativeMethods.SessionDrawPathStreamMesh(_session, mesh.NativeHandle);
+        stopwatch.Stop();
+        var batch = new CommandBufferFlushResult(mesh.ElementCount, 1, stopwatch.Elapsed, nativeResult);
+        _reportFlush(batch);
+        return CombineFlushResults(pending, batch).ToDirectResult();
     }
 
     public unsafe SkiaNativeDirectFlushResult FillPaths(ReadOnlySpan<SkiaNativePathFill> fills)
@@ -315,6 +384,74 @@ public readonly record struct SkiaNativePathStroke(SkiaNativePath Path, Color Co
 public readonly record struct SkiaNativePathFill(SkiaNativePath Path, Color Color);
 
 /// <summary>
+/// Reusable native vertex mesh built from streamed path segments for hot non-antialiased direct rendering.
+/// </summary>
+public sealed class SkiaNativePathStreamMesh : IDisposable
+{
+    private NativePathStreamMeshHandle? _handle;
+
+    private SkiaNativePathStreamMesh(NativePathStreamMeshHandle handle, int elementCount)
+    {
+        _handle = handle;
+        ElementCount = elementCount;
+    }
+
+    public bool IsDisposed => _handle is null;
+
+    public int ElementCount { get; }
+
+    internal NativePathStreamMeshHandle NativeHandle
+    {
+        get
+        {
+            ObjectDisposedException.ThrowIf(_handle is null, this);
+            return _handle;
+        }
+    }
+
+    public static unsafe SkiaNativePathStreamMesh Create(
+        ReadOnlySpan<SkiaNativePathStreamElement> elements,
+        double strokeWidthScale = 1)
+    {
+        if (elements.IsEmpty)
+        {
+            throw new ArgumentException("Path stream mesh requires at least one element.", nameof(elements));
+        }
+
+        if (strokeWidthScale <= 0 || !double.IsFinite(strokeWidthScale))
+        {
+            throw new ArgumentOutOfRangeException(nameof(strokeWidthScale));
+        }
+
+        NativePathStreamMeshHandle handle;
+        fixed (SkiaNativePathStreamElement* ptr = elements)
+        {
+            handle = NativeMethods.PathStreamMeshCreate(ptr, elements.Length, (float)strokeWidthScale);
+        }
+
+        if (handle.IsInvalid)
+        {
+            handle.Dispose();
+            throw new InvalidOperationException("Native Skia path stream mesh creation failed.");
+        }
+
+        return new SkiaNativePathStreamMesh(handle, elements.Length);
+    }
+
+    public void Dispose()
+    {
+        var handle = _handle;
+        if (handle is null)
+        {
+            return;
+        }
+
+        _handle = null;
+        handle.Dispose();
+    }
+}
+
+/// <summary>
 /// Reusable native Skia path resource for hot custom drawing paths.
 /// </summary>
 public sealed class SkiaNativePath : IDisposable
@@ -383,6 +520,20 @@ public sealed class SkiaNativePath : IDisposable
         return new SkiaNativePath(handle);
     }
 
+    public static unsafe SkiaNativePath CreateTransformed(SkiaNativePath source, Matrix transform)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        var nativeTransform = transform.ToNative();
+        var handle = NativeMethods.PathCreateTransformed(source.NativeHandle, &nativeTransform);
+        if (handle.IsInvalid)
+        {
+            handle.Dispose();
+            throw new InvalidOperationException("Native Skia transformed path creation failed.");
+        }
+
+        return new SkiaNativePath(handle);
+    }
+
     public void Dispose()
     {
         var handle = _handle;
@@ -424,6 +575,65 @@ public enum SkiaNativePathCommandKind : uint
     CubicTo = 4,
     ArcTo = 5,
     Close = 6,
+}
+
+public enum SkiaNativePathStreamKind : uint
+{
+    Line = 1,
+    Quad = 2,
+    Cubic = 3,
+}
+
+/// <summary>
+/// Streamed path segment layout used by the native Skia path-stream renderer.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+public readonly struct SkiaNativePathStreamElement
+{
+    public const uint Split = 1u;
+
+    public readonly SkiaNativePathStreamKind Kind;
+    public readonly uint Flags;
+    public readonly float R;
+    public readonly float G;
+    public readonly float B;
+    public readonly float A;
+    public readonly float StrokeThickness;
+    public readonly float StartX;
+    public readonly float StartY;
+    public readonly float Control1X;
+    public readonly float Control1Y;
+    public readonly float Control2X;
+    public readonly float Control2Y;
+    public readonly float EndX;
+    public readonly float EndY;
+
+    public SkiaNativePathStreamElement(
+        SkiaNativePathStreamKind kind,
+        uint flags,
+        Color color,
+        float strokeThickness,
+        Point start,
+        Point control1,
+        Point control2,
+        Point end)
+    {
+        Kind = kind;
+        Flags = flags;
+        R = color.R / 255f;
+        G = color.G / 255f;
+        B = color.B / 255f;
+        A = color.A / 255f;
+        StrokeThickness = strokeThickness;
+        StartX = (float)start.X;
+        StartY = (float)start.Y;
+        Control1X = (float)control1.X;
+        Control1Y = (float)control1.Y;
+        Control2X = (float)control2.X;
+        Control2Y = (float)control2.Y;
+        EndX = (float)end.X;
+        EndY = (float)end.Y;
+    }
 }
 
 /// <summary>

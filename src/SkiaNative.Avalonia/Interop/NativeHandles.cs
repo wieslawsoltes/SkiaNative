@@ -74,6 +74,15 @@ internal sealed class NativePathHandle : NativeSafeHandle
     }
 }
 
+internal sealed class NativePathStreamMeshHandle : NativeSafeHandle
+{
+    protected override bool ReleaseHandle()
+    {
+        NativeMethods.PathStreamMeshDestroy(handle);
+        return true;
+    }
+}
+
 internal sealed class NativeShaderHandle : NativeSafeHandle
 {
     protected override bool ReleaseHandle()

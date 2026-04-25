@@ -22,6 +22,8 @@ internal enum NativeCommandKind : uint
     PushOpacityMaskLayer = 16,
     PopOpacityMaskLayer = 17,
     DrawBoxShadow = 18,
+    ConcatTransform = 19,
+    DrawPathStream = 20,
 }
 
 internal enum NativePixelFormat : uint
@@ -51,6 +53,13 @@ internal enum NativePathCommandKind : uint
     CubicTo = 4,
     ArcTo = 5,
     Close = 6,
+}
+
+internal enum NativePathStreamKind : uint
+{
+    Line = 1,
+    Quad = 2,
+    Cubic = 3,
 }
 
 internal enum NativePathFillRule : uint
@@ -155,6 +164,23 @@ internal struct NativePathStrokeCommand
     public NativeColor Color;
     public float StrokeThickness;
     public uint Flags;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal readonly struct NativePathStreamElement
+{
+    public readonly NativePathStreamKind Kind;
+    public readonly uint Flags;
+    public readonly NativeColor Color;
+    public readonly float StrokeThickness;
+    public readonly float StartX;
+    public readonly float StartY;
+    public readonly float Control1X;
+    public readonly float Control1Y;
+    public readonly float Control2X;
+    public readonly float Control2Y;
+    public readonly float EndX;
+    public readonly float EndY;
 }
 
 [StructLayout(LayoutKind.Sequential)]

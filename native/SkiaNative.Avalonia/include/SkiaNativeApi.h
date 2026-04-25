@@ -19,6 +19,7 @@ typedef struct skn_bitmap skn_bitmap_t;
 typedef struct skn_typeface skn_typeface_t;
 typedef struct skn_glyph_run skn_glyph_run_t;
 typedef struct skn_path skn_path_t;
+typedef struct skn_path_stream_mesh skn_path_stream_mesh_t;
 typedef struct skn_shader skn_shader_t;
 typedef struct skn_stroke skn_stroke_t;
 typedef struct skn_data skn_data_t;
@@ -83,6 +84,21 @@ typedef struct skn_path_stroke_command {
     float stroke_thickness;
     uint32_t flags;
 } skn_path_stroke_command_t;
+
+typedef struct skn_path_stream_element {
+    uint32_t kind;
+    uint32_t flags;
+    skn_color_t color;
+    float stroke_thickness;
+    float start_x;
+    float start_y;
+    float control1_x;
+    float control1_y;
+    float control2_x;
+    float control2_y;
+    float end_x;
+    float end_y;
+} skn_path_stream_element_t;
 
 typedef struct skn_path_fill_command {
     skn_path_t* path;
@@ -152,6 +168,12 @@ typedef enum skn_path_command_kind {
     SKN_PATH_CLOSE = 6
 } skn_path_command_kind_t;
 
+typedef enum skn_path_stream_kind {
+    SKN_PATH_STREAM_LINE = 1,
+    SKN_PATH_STREAM_QUAD = 2,
+    SKN_PATH_STREAM_CUBIC = 3
+} skn_path_stream_kind_t;
+
 typedef enum skn_path_fill_rule {
     SKN_PATH_FILL_NON_ZERO = 0,
     SKN_PATH_FILL_EVEN_ODD = 1
@@ -163,6 +185,11 @@ typedef enum skn_path_op {
     SKN_PATH_OP_XOR = 2,
     SKN_PATH_OP_DIFFERENCE = 3
 } skn_path_op_t;
+
+typedef enum skn_gpu_submit_mode {
+    SKN_GPU_SUBMIT_FLUSH_AND_SUBMIT = 0,
+    SKN_GPU_SUBMIT_FLUSH_ONLY = 1
+} skn_gpu_submit_mode_t;
 
 typedef struct skn_path_command {
     uint32_t kind;
@@ -177,8 +204,8 @@ typedef struct skn_path_command {
     float y3;
 } skn_path_command_t;
 
-SKN_EXPORT skn_context_t* skn_context_create_metal(void* device, void* queue, uint64_t max_resource_bytes, int diagnostics_enabled);
-SKN_EXPORT skn_context_t* skn_context_create_cpu(uint64_t max_resource_bytes, int diagnostics_enabled);
+SKN_EXPORT skn_context_t* skn_context_create_metal(void* device, void* queue, uint64_t max_resource_bytes, int diagnostics_enabled, int gpu_submit_mode);
+SKN_EXPORT skn_context_t* skn_context_create_cpu(uint64_t max_resource_bytes, int diagnostics_enabled, int gpu_submit_mode);
 SKN_EXPORT void skn_context_purge_unlocked_resources(skn_context_t* context);
 SKN_EXPORT int skn_context_get_resource_cache_usage(skn_context_t* context, int* resource_count, uint64_t* resource_bytes, uint64_t* purgeable_bytes, uint64_t* resource_limit);
 SKN_EXPORT void skn_context_destroy(skn_context_t* context);
@@ -188,6 +215,8 @@ SKN_EXPORT skn_session_t* skn_session_begin_raster(skn_context_t* context, int w
 SKN_EXPORT skn_session_t* skn_session_begin_bitmap(skn_context_t* context, skn_bitmap_t* bitmap, double dpi_x, double dpi_y);
 SKN_EXPORT int skn_session_flush_commands(skn_session_t* session, const skn_command_t* commands, int command_count);
 SKN_EXPORT int skn_session_draw_path_strokes(skn_session_t* session, const skn_path_stroke_command_t* commands, int command_count);
+SKN_EXPORT int skn_session_draw_path_stream(skn_session_t* session, const skn_path_stream_element_t* elements, int element_count, skn_stroke_t* stroke, float stroke_width_scale, uint32_t flags);
+SKN_EXPORT int skn_session_draw_path_stream_mesh(skn_session_t* session, skn_path_stream_mesh_t* mesh);
 SKN_EXPORT int skn_session_draw_path_fills(skn_session_t* session, const skn_path_fill_command_t* commands, int command_count);
 SKN_EXPORT int skn_session_draw_glyph_runs(skn_session_t* session, const skn_glyph_run_command_t* commands, int command_count);
 SKN_EXPORT int skn_session_draw_bitmaps(skn_session_t* session, const skn_bitmap_command_t* commands, int command_count);
@@ -229,6 +258,9 @@ SKN_EXPORT int skn_path_get_point_and_tangent_at_distance(skn_path_t* path, floa
 SKN_EXPORT skn_path_t* skn_path_create_segment(skn_path_t* path, float start_distance, float stop_distance, int start_with_move_to);
 SKN_EXPORT skn_path_t* skn_path_create_stroked(skn_path_t* path, float stroke_width, skn_stroke_t* stroke);
 SKN_EXPORT void skn_path_destroy(skn_path_t* path);
+
+SKN_EXPORT skn_path_stream_mesh_t* skn_path_stream_mesh_create(const skn_path_stream_element_t* elements, int element_count, float stroke_width_scale);
+SKN_EXPORT void skn_path_stream_mesh_destroy(skn_path_stream_mesh_t* mesh);
 
 SKN_EXPORT skn_shader_t* skn_shader_create_linear(float x0, float y0, float x1, float y1, const skn_gradient_stop_t* stops, int stop_count, skn_gradient_spread_method_t spread_method);
 SKN_EXPORT skn_shader_t* skn_shader_create_linear_with_matrix(float x0, float y0, float x1, float y1, const skn_gradient_stop_t* stops, int stop_count, skn_gradient_spread_method_t spread_method, const skn_matrix_t* local_matrix);

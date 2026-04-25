@@ -18,7 +18,10 @@ internal sealed class NativeRenderTargetBitmap : NativeWriteableBitmap, IRenderT
 
     public IDrawingContextImpl CreateDrawingContext()
     {
-        var context = NativeMethods.ContextCreateCpu(checked((ulong)(_options.MaxGpuResourceBytes ?? 0)), _options.EnableDiagnostics ? 1 : 0);
+        var context = NativeMethods.ContextCreateCpu(
+            checked((ulong)(_options.MaxGpuResourceBytes ?? 0)),
+            _options.EnableDiagnostics ? 1 : 0,
+            (int)_options.GpuSubmitMode);
         var session = NativeMethods.SessionBeginBitmap(context, NativeBitmap, Dpi.X, Dpi.Y);
         return new NativeDrawingContext(session, Dpi.X / 96.0, context, _options);
     }

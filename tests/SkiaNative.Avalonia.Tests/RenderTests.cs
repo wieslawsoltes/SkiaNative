@@ -80,6 +80,203 @@ public sealed class RenderTests
     }
 
     [Fact]
+    public void RenderTargetBitmap_DirectPathStream_RendersStroke()
+    {
+        using var bitmap = CreateBitmap(64, 64);
+        using (var context = bitmap.CreateDrawingContext())
+        {
+            context.Clear(Colors.Transparent);
+            var feature = Assert.IsAssignableFrom<ISkiaNativeApiLeaseFeature>(
+                context.GetFeature(typeof(ISkiaNativeApiLeaseFeature)));
+
+            using var lease = feature.Lease();
+            var canvas = lease.Canvas;
+            Span<SkiaNativePathStreamElement> elements =
+            [
+                new(
+                    SkiaNativePathStreamKind.Line,
+                    SkiaNativePathStreamElement.Split,
+                    Colors.Red,
+                    8,
+                    new Point(8, 32),
+                    default,
+                    default,
+                    new Point(56, 32))
+            ];
+
+            canvas.StrokePathStream(
+                elements,
+                strokeWidthScale: 1,
+                SkiaNativeStrokeCap.Round,
+                SkiaNativeStrokeJoin.Round);
+        }
+
+        var pixels = bitmap.CopyPixelBytes();
+        var center = GetPixel(bitmap, pixels, 32, 32);
+        AssertColor(center, r: 255, g: 0, b: 0, a: 255, tolerance: 3);
+    }
+
+    [Fact]
+    public void RenderTargetBitmap_DirectPathStream_UsesConcatTransform()
+    {
+        using var bitmap = CreateBitmap(80, 80);
+        using (var context = bitmap.CreateDrawingContext())
+        {
+            context.Clear(Colors.Transparent);
+            var feature = Assert.IsAssignableFrom<ISkiaNativeApiLeaseFeature>(
+                context.GetFeature(typeof(ISkiaNativeApiLeaseFeature)));
+
+            using var lease = feature.Lease();
+            var canvas = lease.Canvas;
+            canvas.Save();
+            canvas.ConcatTransform(Matrix.CreateScale(2, 2) * Matrix.CreateTranslation(10, 20));
+
+            Span<SkiaNativePathStreamElement> elements =
+            [
+                new(
+                    SkiaNativePathStreamKind.Line,
+                    SkiaNativePathStreamElement.Split,
+                    Colors.Lime,
+                    4,
+                    new Point(4, 4),
+                    default,
+                    default,
+                    new Point(24, 4))
+            ];
+
+            canvas.StrokePathStream(
+                elements,
+                strokeWidthScale: 1,
+                SkiaNativeStrokeCap.Butt,
+                SkiaNativeStrokeJoin.Round);
+            canvas.Restore();
+        }
+
+        var pixels = bitmap.CopyPixelBytes();
+        AssertColor(GetPixel(bitmap, pixels, 24, 28), r: 0, g: 255, b: 0, a: 255, tolerance: 3);
+        Assert.True(GetPixel(bitmap, pixels, 8, 8).A <= 2, "Expected untransformed stream location to stay transparent.");
+    }
+
+    [Fact]
+    public void RenderTargetBitmap_DirectPathStream_FastVerticesPreserveColor()
+    {
+        using var bitmap = CreateBitmap(64, 64);
+        using (var context = bitmap.CreateDrawingContext())
+        {
+            context.Clear(Colors.Transparent);
+            var feature = Assert.IsAssignableFrom<ISkiaNativeApiLeaseFeature>(
+                context.GetFeature(typeof(ISkiaNativeApiLeaseFeature)));
+
+            using var lease = feature.Lease();
+            var canvas = lease.Canvas;
+            Span<SkiaNativePathStreamElement> elements =
+            [
+                new(
+                    SkiaNativePathStreamKind.Line,
+                    SkiaNativePathStreamElement.Split,
+                    Colors.DeepSkyBlue,
+                    8,
+                    new Point(8, 32),
+                    default,
+                    default,
+                    new Point(56, 32))
+            ];
+
+            canvas.StrokePathStream(
+                elements,
+                strokeWidthScale: 1,
+                SkiaNativeStrokeCap.Butt,
+                SkiaNativeStrokeJoin.Miter,
+                antiAlias: false);
+        }
+
+        var pixels = bitmap.CopyPixelBytes();
+        var center = GetPixel(bitmap, pixels, 32, 32);
+        AssertColor(center, r: 0, g: 191, b: 255, a: 255, tolerance: 3);
+    }
+
+    [Fact]
+    public void RenderTargetBitmap_DirectPathStream_FastVerticesHonorSplitRuns()
+    {
+        using var bitmap = CreateBitmap(64, 64);
+        using (var context = bitmap.CreateDrawingContext())
+        {
+            context.Clear(Colors.Transparent);
+            var feature = Assert.IsAssignableFrom<ISkiaNativeApiLeaseFeature>(
+                context.GetFeature(typeof(ISkiaNativeApiLeaseFeature)));
+
+            using var lease = feature.Lease();
+            var canvas = lease.Canvas;
+            Span<SkiaNativePathStreamElement> elements =
+            [
+                new(
+                    SkiaNativePathStreamKind.Line,
+                    0,
+                    Colors.Red,
+                    8,
+                    new Point(8, 32),
+                    default,
+                    default,
+                    new Point(32, 32)),
+                new(
+                    SkiaNativePathStreamKind.Line,
+                    SkiaNativePathStreamElement.Split,
+                    Colors.DeepSkyBlue,
+                    8,
+                    new Point(32, 32),
+                    default,
+                    default,
+                    new Point(56, 32))
+            ];
+
+            canvas.StrokePathStream(
+                elements,
+                strokeWidthScale: 1,
+                SkiaNativeStrokeCap.Butt,
+                SkiaNativeStrokeJoin.Miter,
+                antiAlias: false);
+        }
+
+        var pixels = bitmap.CopyPixelBytes();
+        var firstSegment = GetPixel(bitmap, pixels, 16, 32);
+        AssertColor(firstSegment, r: 0, g: 191, b: 255, a: 255, tolerance: 3);
+    }
+
+    [Fact]
+    public void RenderTargetBitmap_DirectPathStreamMesh_CanBeReused()
+    {
+        Span<SkiaNativePathStreamElement> elements =
+        [
+            new(
+                SkiaNativePathStreamKind.Line,
+                SkiaNativePathStreamElement.Split,
+                Colors.OrangeRed,
+                8,
+                new Point(8, 32),
+                default,
+                default,
+                new Point(56, 32))
+        ];
+
+        using var mesh = SkiaNativePathStreamMesh.Create(elements);
+        using var bitmap = CreateBitmap(64, 64);
+        using (var context = bitmap.CreateDrawingContext())
+        {
+            context.Clear(Colors.Transparent);
+            var feature = Assert.IsAssignableFrom<ISkiaNativeApiLeaseFeature>(
+                context.GetFeature(typeof(ISkiaNativeApiLeaseFeature)));
+
+            using var lease = feature.Lease();
+            lease.Canvas.DrawPathStreamMesh(mesh);
+            lease.Canvas.DrawPathStreamMesh(mesh);
+        }
+
+        var pixels = bitmap.CopyPixelBytes();
+        var center = GetPixel(bitmap, pixels, 32, 32);
+        AssertColor(center, r: 255, g: 69, b: 0, a: 255, tolerance: 3);
+    }
+
+    [Fact]
     public void RenderTargetBitmap_Readback_AppliesOpacityMaskAlpha()
     {
         using var bitmap = CreateBitmap(100, 24);

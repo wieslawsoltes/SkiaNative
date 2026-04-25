@@ -29,6 +29,7 @@ internal sealed class CommandBuffer : IDisposable
     private readonly PooledReferenceList<NativeShaderHandle> _ownedShaders;
     private readonly PooledReferenceList<NativeStrokeHandle> _ownedStrokes;
     private readonly PooledReferenceList<NativePathHandle> _ownedPaths;
+    private readonly PooledReferenceList<PinnedPathStreamBuffer> _pinnedPathStreams;
     private readonly TileBrushIntermediateCache _tileBrushCache = new();
     private readonly Stack<bool> _opacityMaskLayers = new();
 
@@ -39,6 +40,7 @@ internal sealed class CommandBuffer : IDisposable
         _ownedShaders = new PooledReferenceList<NativeShaderHandle>();
         _ownedStrokes = new PooledReferenceList<NativeStrokeHandle>();
         _ownedPaths = new PooledReferenceList<NativePathHandle>();
+        _pinnedPathStreams = new PooledReferenceList<PinnedPathStreamBuffer>();
     }
 
     public int CommandCount => _commandCount;
@@ -53,6 +55,37 @@ internal sealed class CommandBuffer : IDisposable
         Kind = NativeCommandKind.SetTransform,
         Matrix = matrix.ToNative()
     });
+
+    public void ConcatTransform(Matrix matrix) => AddCommand(new NativeCommand
+    {
+        Kind = NativeCommandKind.ConcatTransform,
+        Matrix = matrix.ToNative()
+    });
+
+    public void DrawPathStream(
+        ReadOnlySpan<SkiaNativePathStreamElement> elements,
+        NativeStrokeHandle stroke,
+        double strokeWidthScale,
+        uint flags)
+    {
+        if (elements.IsEmpty || stroke.IsInvalid || strokeWidthScale <= 0 || !double.IsFinite(strokeWidthScale))
+        {
+            return;
+        }
+
+        var stream = PinnedPathStreamBuffer.Create(elements);
+        _pinnedPathStreams.Add(stream);
+        _resources.Add(stroke);
+        AddCommand(new NativeCommand
+        {
+            Kind = NativeCommandKind.DrawPathStream,
+            Flags = flags,
+            Resource0 = stream.Pointer,
+            Resource1 = stroke.DangerousGetHandle(),
+            X0 = stream.Count,
+            X1 = (float)strokeWidthScale
+        });
+    }
 
     public void Clear(Color color) => AddCommand(new NativeCommand
     {
@@ -784,6 +817,7 @@ internal sealed class CommandBuffer : IDisposable
         _ownedShaders.Dispose();
         _ownedStrokes.Dispose();
         _ownedPaths.Dispose();
+        _pinnedPathStreams.Dispose();
         _tileBrushCache.Dispose();
         _disposed = true;
     }
@@ -807,6 +841,11 @@ internal sealed class CommandBuffer : IDisposable
             _ownedPaths[i].Dispose();
         }
         _ownedPaths.Clear();
+        for (var i = 0; i < _pinnedPathStreams.Count; i++)
+        {
+            _pinnedPathStreams[i].Dispose();
+        }
+        _pinnedPathStreams.Clear();
         _tileBrushCache.Clear();
     }
 
@@ -1378,6 +1417,47 @@ internal sealed class TileBrushIntermediateCache : IDisposable
     }
 
     public void Dispose() => Clear();
+}
+
+internal sealed class PinnedPathStreamBuffer : IDisposable
+{
+    private SkiaNativePathStreamElement[] _buffer;
+    private GCHandle _handle;
+
+    private PinnedPathStreamBuffer(SkiaNativePathStreamElement[] buffer, int count)
+    {
+        _buffer = buffer;
+        Count = count;
+        _handle = GCHandle.Alloc(buffer, GCHandleType.Pinned);
+        Pointer = _handle.AddrOfPinnedObject();
+    }
+
+    public int Count { get; }
+    public nint Pointer { get; private set; }
+
+    public static PinnedPathStreamBuffer Create(ReadOnlySpan<SkiaNativePathStreamElement> elements)
+    {
+        var buffer = ArrayPool<SkiaNativePathStreamElement>.Shared.Rent(elements.Length);
+        elements.CopyTo(buffer);
+        return new PinnedPathStreamBuffer(buffer, elements.Length);
+    }
+
+    public void Dispose()
+    {
+        if (_buffer.Length == 0)
+        {
+            return;
+        }
+
+        if (_handle.IsAllocated)
+        {
+            _handle.Free();
+        }
+
+        ArrayPool<SkiaNativePathStreamElement>.Shared.Return(_buffer);
+        _buffer = [];
+        Pointer = 0;
+    }
 }
 
 internal sealed class TileBrushCacheEntry : IDisposable

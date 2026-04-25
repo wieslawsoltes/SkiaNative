@@ -17,6 +17,7 @@ static_assert(sizeof(skn_color_t) == 16, "skn_color_t must stay ABI-compatible w
 static_assert(sizeof(skn_matrix_t) == 48, "skn_matrix_t must stay ABI-compatible with NativeMatrix.");
 static_assert(sizeof(skn_command_t) == 152, "skn_command_t must stay ABI-compatible with NativeCommand.");
 static_assert(sizeof(skn_path_stroke_command_t) == 48, "skn_path_stroke_command_t must stay ABI-compatible with NativePathStrokeCommand.");
+static_assert(sizeof(skn_path_stream_element_t) == 60, "skn_path_stream_element_t must stay ABI-compatible with NativePathStreamElement.");
 static_assert(sizeof(skn_path_fill_command_t) == 40, "skn_path_fill_command_t must stay ABI-compatible with NativePathFillCommand.");
 static_assert(sizeof(skn_glyph_run_command_t) == 40, "skn_glyph_run_command_t must stay ABI-compatible with NativeGlyphRunCommand.");
 static_assert(sizeof(skn_bitmap_command_t) == 64, "skn_bitmap_command_t must stay ABI-compatible with NativeBitmapCommand.");
@@ -50,6 +51,7 @@ static_assert(sizeof(skn_path_command_t) == 40, "skn_path_command_t must stay AB
 #include "include/core/SkTextBlob.h"
 #include "include/core/SkTileMode.h"
 #include "include/core/SkTypeface.h"
+#include "include/core/SkVertices.h"
 #include "include/effects/SkDashPathEffect.h"
 #include "include/effects/SkGradient.h"
 #include "include/effects/SkImageFilters.h"
@@ -107,6 +109,8 @@ enum CommandKind : uint32_t {
     PushOpacityMaskLayer = 16,
     PopOpacityMaskLayer = 17,
     DrawBoxShadow = 18,
+    ConcatTransform = 19,
+    DrawPathStream = 20,
 };
 
 #if defined(SKIANATIVE_WITH_SKIA)
@@ -143,6 +147,7 @@ static constexpr uint32_t kTextHintingMask = 0x3u << kTextHintingShift;
 static constexpr uint32_t kTextForceAutoHintingFlag = 1u << 4u;
 static constexpr uint32_t kTextSubpixelFlag = 1u << 5u;
 static constexpr uint32_t kTextBaselineSnapFlag = 1u << 6u;
+static constexpr uint32_t kPathStreamSplitFlag = 1u;
 
 static SkSamplingOptions bitmap_sampling_options(uint32_t flags) {
     switch (flags & kBitmapSamplingMask) {
@@ -251,6 +256,357 @@ static SkMatrix to_sk_matrix(const skn_matrix_t& matrix) {
     return result;
 }
 
+static uint8_t color_channel_byte(float value) {
+    return static_cast<uint8_t>(std::clamp(value, 0.0f, 1.0f) * 255.0f + 0.5f);
+}
+
+static SkColor to_sk_color32(const skn_color_t& color) {
+    return SkColorSetARGB(
+        color_channel_byte(color.a),
+        color_channel_byte(color.r),
+        color_channel_byte(color.g),
+        color_channel_byte(color.b));
+}
+
+static SkPoint eval_quad(SkPoint p0, SkPoint p1, SkPoint p2, float t) {
+    const float one_minus_t = 1.0f - t;
+    const float a = one_minus_t * one_minus_t;
+    const float b = 2.0f * one_minus_t * t;
+    const float c = t * t;
+    return SkPoint::Make(
+        a * p0.fX + b * p1.fX + c * p2.fX,
+        a * p0.fY + b * p1.fY + c * p2.fY);
+}
+
+static SkPoint eval_cubic(SkPoint p0, SkPoint p1, SkPoint p2, SkPoint p3, float t) {
+    const float one_minus_t = 1.0f - t;
+    const float a = one_minus_t * one_minus_t * one_minus_t;
+    const float b = 3.0f * one_minus_t * one_minus_t * t;
+    const float c = 3.0f * one_minus_t * t * t;
+    const float d = t * t * t;
+    return SkPoint::Make(
+        a * p0.fX + b * p1.fX + c * p2.fX + d * p3.fX,
+        a * p0.fY + b * p1.fY + c * p2.fY + d * p3.fY);
+}
+
+static void append_stroke_segment_vertices(
+    std::vector<SkPoint>& positions,
+    std::vector<SkColor>& colors,
+    SkPoint start,
+    SkPoint end,
+    float stroke_width,
+    SkColor color) {
+    const float dx = end.fX - start.fX;
+    const float dy = end.fY - start.fY;
+    const float length_sq = dx * dx + dy * dy;
+    if (length_sq <= 0.0001f || stroke_width <= 0.0f || !std::isfinite(stroke_width)) {
+        return;
+    }
+
+    const float inv_length = 1.0f / std::sqrt(length_sq);
+    const float half_width = stroke_width * 0.5f;
+    const float nx = -dy * inv_length * half_width;
+    const float ny = dx * inv_length * half_width;
+
+    const SkPoint p0 = SkPoint::Make(start.fX + nx, start.fY + ny);
+    const SkPoint p1 = SkPoint::Make(start.fX - nx, start.fY - ny);
+    const SkPoint p2 = SkPoint::Make(end.fX + nx, end.fY + ny);
+    const SkPoint p3 = SkPoint::Make(end.fX - nx, end.fY - ny);
+
+    positions.push_back(p0);
+    positions.push_back(p1);
+    positions.push_back(p2);
+    positions.push_back(p2);
+    positions.push_back(p1);
+    positions.push_back(p3);
+
+    for (int i = 0; i < 6; ++i) {
+        colors.push_back(color);
+    }
+}
+
+template <typename AppendLine>
+static void append_path_stream_element_vertices(
+    const skn_path_stream_element_t& element,
+    float stroke_width,
+    SkColor color,
+    AppendLine& append_line) {
+    const auto start = SkPoint::Make(element.start_x, element.start_y);
+    const auto control1 = SkPoint::Make(element.control1_x, element.control1_y);
+    const auto control2 = SkPoint::Make(element.control2_x, element.control2_y);
+    const auto end = SkPoint::Make(element.end_x, element.end_y);
+
+    switch (element.kind) {
+        case SKN_PATH_STREAM_LINE:
+            append_line(start, end, stroke_width, color);
+            break;
+        case SKN_PATH_STREAM_QUAD: {
+            constexpr int kSegments = 8;
+            SkPoint previous = start;
+            for (int segment = 1; segment <= kSegments; ++segment) {
+                const float t = static_cast<float>(segment) / static_cast<float>(kSegments);
+                SkPoint current = eval_quad(start, control1, end, t);
+                append_line(previous, current, stroke_width, color);
+                previous = current;
+            }
+            break;
+        }
+        case SKN_PATH_STREAM_CUBIC: {
+            constexpr int kSegments = 12;
+            SkPoint previous = start;
+            for (int segment = 1; segment <= kSegments; ++segment) {
+                const float t = static_cast<float>(segment) / static_cast<float>(kSegments);
+                SkPoint current = eval_cubic(start, control1, control2, end, t);
+                append_line(previous, current, stroke_width, color);
+                previous = current;
+            }
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+static int build_path_stream_vertex_batches(
+    const skn_path_stream_element_t* elements,
+    int element_count,
+    float stroke_width_scale,
+    std::vector<sk_sp<SkVertices>>& batches) {
+    constexpr size_t kMaxBatchVertices = 60'000;
+    std::vector<SkPoint> positions;
+    std::vector<SkColor> colors;
+    positions.reserve(kMaxBatchVertices);
+    colors.reserve(kMaxBatchVertices);
+
+    auto flush = [&]() {
+        if (positions.empty()) {
+            return;
+        }
+
+        auto vertices = SkVertices::MakeCopy(
+            SkVertices::kTriangles_VertexMode,
+            static_cast<int>(positions.size()),
+            positions.data(),
+            nullptr,
+            colors.data());
+        if (vertices) {
+            batches.push_back(std::move(vertices));
+        }
+
+        positions.clear();
+        colors.clear();
+    };
+
+    auto ensure_capacity = [&]() {
+        if (positions.size() + 72 >= kMaxBatchVertices) {
+            flush();
+        }
+    };
+
+    int drawn = 0;
+    auto append_line = [&](SkPoint start, SkPoint end, float stroke_width, SkColor color) {
+        ensure_capacity();
+        const auto before = positions.size();
+        append_stroke_segment_vertices(positions, colors, start, end, stroke_width, color);
+        if (positions.size() != before) {
+            ++drawn;
+        }
+    };
+
+    int run_start = 0;
+    for (int i = 0; i < element_count; ++i) {
+        const auto& run_paint = elements[i];
+        if ((run_paint.flags & kPathStreamSplitFlag) == 0 && i != element_count - 1) {
+            continue;
+        }
+
+        const auto stroke_width = run_paint.stroke_thickness * stroke_width_scale;
+        if (run_paint.color.a > 0.0f && stroke_width > 0.0f && std::isfinite(stroke_width)) {
+            const auto color = to_sk_color32(run_paint.color);
+            for (int j = run_start; j <= i; ++j) {
+                append_path_stream_element_vertices(elements[j], stroke_width, color, append_line);
+            }
+        }
+
+        run_start = i + 1;
+    }
+
+    flush();
+    return drawn;
+}
+
+static int draw_path_stream_vertex_batches(
+    SkCanvas* canvas,
+    const std::vector<sk_sp<SkVertices>>& batches,
+    int drawn_segments) {
+    if (canvas == nullptr || batches.empty()) {
+        return 0;
+    }
+
+    SkPaint paint;
+    paint.setColor(SK_ColorWHITE);
+    for (const auto& vertices : batches) {
+        if (vertices) {
+            canvas->drawVertices(vertices, SkBlendMode::kModulate, paint);
+        }
+    }
+
+    return drawn_segments;
+}
+
+static int draw_path_stream_vertices(
+    SkCanvas* canvas,
+    const skn_path_stream_element_t* elements,
+    int element_count,
+    float stroke_width_scale) {
+    constexpr size_t kMaxBatchVertices = 60'000;
+    std::vector<SkPoint> positions;
+    std::vector<SkColor> colors;
+    positions.reserve(kMaxBatchVertices);
+    colors.reserve(kMaxBatchVertices);
+
+    SkPaint paint;
+    paint.setColor(SK_ColorWHITE);
+
+    auto flush = [&]() {
+        if (positions.empty()) {
+            return;
+        }
+
+        auto vertices = SkVertices::MakeCopy(
+            SkVertices::kTriangles_VertexMode,
+            static_cast<int>(positions.size()),
+            positions.data(),
+            nullptr,
+            colors.data());
+        if (vertices) {
+            canvas->drawVertices(vertices, SkBlendMode::kModulate, paint);
+        }
+
+        positions.clear();
+        colors.clear();
+    };
+
+    auto ensure_capacity = [&]() {
+        if (positions.size() + 72 >= kMaxBatchVertices) {
+            flush();
+        }
+    };
+
+    int drawn = 0;
+    auto append_line = [&](SkPoint start, SkPoint end, float stroke_width, SkColor color) {
+        ensure_capacity();
+        const auto before = positions.size();
+        append_stroke_segment_vertices(positions, colors, start, end, stroke_width, color);
+        if (positions.size() != before) {
+            ++drawn;
+        }
+    };
+
+    int run_start = 0;
+    for (int i = 0; i < element_count; ++i) {
+        const auto& run_paint = elements[i];
+        if ((run_paint.flags & kPathStreamSplitFlag) == 0 && i != element_count - 1) {
+            continue;
+        }
+
+        const auto stroke_width = run_paint.stroke_thickness * stroke_width_scale;
+        if (run_paint.color.a > 0.0f && stroke_width > 0.0f && std::isfinite(stroke_width)) {
+            const auto color = to_sk_color32(run_paint.color);
+            for (int j = run_start; j <= i; ++j) {
+                append_path_stream_element_vertices(elements[j], stroke_width, color, append_line);
+            }
+        }
+
+        run_start = i + 1;
+    }
+
+    flush();
+    return drawn;
+}
+
+static int draw_path_stream_elements(
+    SkCanvas* canvas,
+    const skn_path_stream_element_t* elements,
+    int element_count,
+    skn_stroke_t* stroke,
+    float stroke_width_scale,
+    uint32_t flags) {
+    if (canvas == nullptr || elements == nullptr || element_count <= 0 ||
+        stroke_width_scale <= 0.0f || !std::isfinite(stroke_width_scale)) {
+        return 0;
+    }
+
+    if ((flags & kShapeAntiAliasFlag) == 0) {
+        return draw_path_stream_vertices(canvas, elements, element_count, stroke_width_scale);
+    }
+
+    auto paint = make_command_paint({0, 0, 0, 1}, SkPaint::kStroke_Style, 1.0f, nullptr, stroke);
+    apply_shape_paint_flags(paint, flags);
+    SkPathBuilder builder(SkPathFillType::kWinding);
+    builder.setIsVolatile(true);
+
+    int drawn = 0;
+    bool path_started = false;
+    skn_color_t run_color = {0, 0, 0, 0};
+    float run_stroke_width = 0.0f;
+
+    auto flush_run = [&]() {
+        if (!path_started || run_color.a <= 0.0f || run_stroke_width <= 0.0f || !std::isfinite(run_stroke_width)) {
+            builder.reset();
+            path_started = false;
+            return;
+        }
+
+        paint.setColor4f(to_sk_color(run_color));
+        paint.setStrokeWidth(run_stroke_width);
+        auto path = builder.detach();
+        path.setIsVolatile(true);
+        canvas->drawPath(path, paint);
+        path_started = false;
+        ++drawn;
+    };
+
+    for (int i = 0; i < element_count; ++i) {
+        const auto& element = elements[i];
+        const auto stroke_width = element.stroke_thickness * stroke_width_scale;
+        const auto start = SkPoint::Make(element.start_x, element.start_y);
+        const auto control1 = SkPoint::Make(element.control1_x, element.control1_y);
+        const auto control2 = SkPoint::Make(element.control2_x, element.control2_y);
+        const auto end = SkPoint::Make(element.end_x, element.end_y);
+
+        if (!path_started) {
+            builder.moveTo(start);
+            path_started = true;
+        }
+
+        switch (element.kind) {
+            case SKN_PATH_STREAM_LINE:
+                builder.lineTo(end);
+                break;
+            case SKN_PATH_STREAM_QUAD:
+                builder.quadTo(control1, end);
+                break;
+            case SKN_PATH_STREAM_CUBIC:
+                builder.cubicTo(control1, control2, end);
+                break;
+            default:
+                if ((element.flags & kPathStreamSplitFlag) != 0) {
+                    flush_run();
+                }
+                continue;
+        }
+
+        run_color = element.color;
+        run_stroke_width = stroke_width;
+        if ((element.flags & kPathStreamSplitFlag) != 0 || i == element_count - 1) {
+            flush_run();
+        }
+    }
+
+    return drawn;
+}
+
 static SkPathOp to_sk_path_op(skn_path_op_t op) {
     switch (op) {
         case SKN_PATH_OP_INTERSECT:
@@ -324,6 +680,7 @@ struct skn_context {
     void* metal_device = nullptr;
     void* metal_queue = nullptr;
     uint64_t max_resource_bytes = 0;
+    int gpu_submit_mode = SKN_GPU_SUBMIT_FLUSH_AND_SUBMIT;
     bool diagnostics_enabled = false;
 #if defined(SKIANATIVE_WITH_SKIA)
     sk_sp<GrDirectContext> direct_context;
@@ -376,6 +733,13 @@ struct skn_glyph_run {
 struct skn_path {
 #if defined(SKIANATIVE_WITH_SKIA)
     SkPath path;
+#endif
+};
+
+struct skn_path_stream_mesh {
+    int drawn_segments = 0;
+#if defined(SKIANATIVE_WITH_SKIA)
+    std::vector<sk_sp<SkVertices>> vertex_batches;
 #endif
 };
 
@@ -569,7 +933,11 @@ static void flush_session_surface(skn_session_t* session) {
     }
 
     if (session->context != nullptr && session->context->direct_context) {
-        session->context->direct_context->flushAndSubmit(session->surface.get());
+        if (session->context->gpu_submit_mode == SKN_GPU_SUBMIT_FLUSH_ONLY) {
+            session->context->direct_context->flush(session->surface.get());
+        } else {
+            session->context->direct_context->flushAndSubmit(session->surface.get(), GrSyncCpu::kNo);
+        }
     }
 
     if (session->bitmap_target != nullptr) {
@@ -582,12 +950,15 @@ static void flush_session_surface(skn_session_t* session) {
 
 extern "C" {
 
-SKN_EXPORT skn_context_t* skn_context_create_metal(void* device, void* queue, uint64_t max_resource_bytes, int diagnostics_enabled) {
+SKN_EXPORT skn_context_t* skn_context_create_metal(void* device, void* queue, uint64_t max_resource_bytes, int diagnostics_enabled, int gpu_submit_mode) {
     ScopedAutoreleasePool autorelease_pool;
     auto* context = new skn_context_t();
     context->metal_device = device;
     context->metal_queue = queue;
     context->max_resource_bytes = max_resource_bytes;
+    context->gpu_submit_mode = gpu_submit_mode == SKN_GPU_SUBMIT_FLUSH_ONLY
+        ? SKN_GPU_SUBMIT_FLUSH_ONLY
+        : SKN_GPU_SUBMIT_FLUSH_AND_SUBMIT;
     context->diagnostics_enabled = diagnostics_enabled != 0;
 #if defined(SKIANATIVE_WITH_SKIA)
     if (device != nullptr && queue != nullptr) {
@@ -615,9 +986,12 @@ SKN_EXPORT skn_context_t* skn_context_create_metal(void* device, void* queue, ui
     return context;
 }
 
-SKN_EXPORT skn_context_t* skn_context_create_cpu(uint64_t max_resource_bytes, int diagnostics_enabled) {
+SKN_EXPORT skn_context_t* skn_context_create_cpu(uint64_t max_resource_bytes, int diagnostics_enabled, int gpu_submit_mode) {
     auto* context = new skn_context_t();
     context->max_resource_bytes = max_resource_bytes;
+    context->gpu_submit_mode = gpu_submit_mode == SKN_GPU_SUBMIT_FLUSH_ONLY
+        ? SKN_GPU_SUBMIT_FLUSH_ONLY
+        : SKN_GPU_SUBMIT_FLUSH_AND_SUBMIT;
     context->diagnostics_enabled = diagnostics_enabled != 0;
     return context;
 }
@@ -787,6 +1161,20 @@ SKN_EXPORT int skn_session_flush_commands(skn_session_t* session, const skn_comm
                 break;
             case SetTransform: {
                 canvas->setMatrix(to_sk_matrix(command.matrix));
+                break;
+            }
+            case ConcatTransform: {
+                canvas->concat(to_sk_matrix(command.matrix));
+                break;
+            }
+            case DrawPathStream: {
+                draw_path_stream_elements(
+                    canvas,
+                    static_cast<const skn_path_stream_element_t*>(command.resource0),
+                    static_cast<int>(command.x0),
+                    static_cast<skn_stroke_t*>(command.resource1),
+                    command.x1,
+                    command.flags);
                 break;
             }
             case Clear:
@@ -1043,6 +1431,50 @@ SKN_EXPORT int skn_session_draw_path_strokes(skn_session_t* session, const skn_p
 #endif
 
     return command_count;
+}
+
+SKN_EXPORT int skn_session_draw_path_stream(skn_session_t* session, const skn_path_stream_element_t* elements, int element_count, skn_stroke_t* stroke, float stroke_width_scale, uint32_t flags) {
+    ScopedAutoreleasePool autorelease_pool;
+    if (session == nullptr || elements == nullptr || element_count < 0) {
+        return -1;
+    }
+
+    if (stroke_width_scale <= 0.0f || !std::isfinite(stroke_width_scale)) {
+        return 0;
+    }
+
+#if defined(SKIANATIVE_WITH_SKIA)
+    if (!session->surface) {
+        return 0;
+    }
+
+    return draw_path_stream_elements(
+        session->surface->getCanvas(),
+        elements,
+        element_count,
+        stroke,
+        stroke_width_scale,
+        flags);
+#endif
+
+    return element_count;
+}
+
+SKN_EXPORT int skn_session_draw_path_stream_mesh(skn_session_t* session, skn_path_stream_mesh_t* mesh) {
+    ScopedAutoreleasePool autorelease_pool;
+    if (session == nullptr || mesh == nullptr) {
+        return -1;
+    }
+
+#if defined(SKIANATIVE_WITH_SKIA)
+    if (!session->surface) {
+        return 0;
+    }
+
+    return draw_path_stream_vertex_batches(session->surface->getCanvas(), mesh->vertex_batches, mesh->drawn_segments);
+#else
+    return mesh->drawn_segments;
+#endif
 }
 
 SKN_EXPORT int skn_session_draw_path_fills(skn_session_t* session, const skn_path_fill_command_t* commands, int command_count) {
@@ -1708,6 +2140,28 @@ SKN_EXPORT skn_path_t* skn_path_create_stroked(skn_path_t* path, float stroke_wi
 
 SKN_EXPORT void skn_path_destroy(skn_path_t* path) {
     delete path;
+}
+
+SKN_EXPORT skn_path_stream_mesh_t* skn_path_stream_mesh_create(const skn_path_stream_element_t* elements, int element_count, float stroke_width_scale) {
+    if (elements == nullptr || element_count <= 0 || stroke_width_scale <= 0.0f || !std::isfinite(stroke_width_scale)) {
+        return nullptr;
+    }
+
+    auto* mesh = new skn_path_stream_mesh_t();
+#if defined(SKIANATIVE_WITH_SKIA)
+    mesh->drawn_segments = build_path_stream_vertex_batches(elements, element_count, stroke_width_scale, mesh->vertex_batches);
+    if (mesh->drawn_segments <= 0 || mesh->vertex_batches.empty()) {
+        delete mesh;
+        return nullptr;
+    }
+#else
+    mesh->drawn_segments = element_count;
+#endif
+    return mesh;
+}
+
+SKN_EXPORT void skn_path_stream_mesh_destroy(skn_path_stream_mesh_t* mesh) {
+    delete mesh;
 }
 
 static skn_shader_t* create_linear_shader(float x0, float y0, float x1, float y1, const skn_gradient_stop_t* stops, int stop_count, skn_gradient_spread_method_t spread_method, const skn_matrix_t* local_matrix) {

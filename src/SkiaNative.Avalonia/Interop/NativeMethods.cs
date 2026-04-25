@@ -8,10 +8,10 @@ internal static unsafe partial class NativeMethods
     internal const string LibraryName = "SkiaNativeAvalonia";
 
     [LibraryImport(LibraryName, EntryPoint = "skn_context_create_metal")]
-    internal static partial NativeContextHandle ContextCreateMetal(nint device, nint queue, ulong maxResourceBytes, int diagnosticsEnabled);
+    internal static partial NativeContextHandle ContextCreateMetal(nint device, nint queue, ulong maxResourceBytes, int diagnosticsEnabled, int gpuSubmitMode);
 
     [LibraryImport(LibraryName, EntryPoint = "skn_context_create_cpu")]
-    internal static partial NativeContextHandle ContextCreateCpu(ulong maxResourceBytes, int diagnosticsEnabled);
+    internal static partial NativeContextHandle ContextCreateCpu(ulong maxResourceBytes, int diagnosticsEnabled, int gpuSubmitMode);
 
     [LibraryImport(LibraryName, EntryPoint = "skn_context_purge_unlocked_resources")]
     internal static partial void ContextPurgeUnlockedResources(NativeContextHandle context);
@@ -47,6 +47,12 @@ internal static unsafe partial class NativeMethods
 
     [LibraryImport(LibraryName, EntryPoint = "skn_session_draw_path_strokes")]
     internal static partial int SessionDrawPathStrokes(NativeSessionHandle session, NativePathStrokeCommand* commands, int commandCount);
+
+    [LibraryImport(LibraryName, EntryPoint = "skn_session_draw_path_stream")]
+    internal static partial int SessionDrawPathStream(NativeSessionHandle session, SkiaNativePathStreamElement* elements, int elementCount, NativeStrokeHandle stroke, float strokeWidthScale, uint flags);
+
+    [LibraryImport(LibraryName, EntryPoint = "skn_session_draw_path_stream_mesh")]
+    internal static partial int SessionDrawPathStreamMesh(NativeSessionHandle session, NativePathStreamMeshHandle mesh);
 
     [LibraryImport(LibraryName, EntryPoint = "skn_session_draw_path_fills")]
     internal static partial int SessionDrawPathFills(NativeSessionHandle session, NativePathFillCommand* commands, int commandCount);
@@ -166,6 +172,13 @@ internal static unsafe partial class NativeMethods
     [LibraryImport(LibraryName, EntryPoint = "skn_path_destroy")]
     [SuppressGCTransition]
     internal static partial void PathDestroy(nint path);
+
+    [LibraryImport(LibraryName, EntryPoint = "skn_path_stream_mesh_create")]
+    internal static partial NativePathStreamMeshHandle PathStreamMeshCreate(SkiaNativePathStreamElement* elements, int elementCount, float strokeWidthScale);
+
+    [LibraryImport(LibraryName, EntryPoint = "skn_path_stream_mesh_destroy")]
+    [SuppressGCTransition]
+    internal static partial void PathStreamMeshDestroy(nint mesh);
 
     [LibraryImport(LibraryName, EntryPoint = "skn_shader_create_linear")]
     internal static partial NativeShaderHandle ShaderCreateLinear(float x0, float y0, float x1, float y1, NativeGradientStop* stops, int stopCount, NativeGradientSpreadMethod spreadMethod);

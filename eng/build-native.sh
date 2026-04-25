@@ -47,11 +47,12 @@ for rid in "${RIDS[@]}"; do
   native_out="$ROOT/artifacts/native/$rid"
   mkdir -p "$native_out"
 
-  (cd "$SKIA_ROOT" && bin/gn gen "$skia_out" --args="target_os=\"mac\" target_cpu=\"$skia_arch\" is_debug=false is_official_build=true skia_use_metal=true skia_use_gl=false skia_use_vulkan=false skia_use_dawn=false skia_enable_tools=false skia_enable_ganesh=true skia_use_system_expat=false skia_use_system_harfbuzz=false skia_use_system_icu=false skia_use_system_libjpeg_turbo=false skia_use_system_libpng=false skia_use_system_libwebp=false skia_use_system_zlib=false")
-  ninja -C "$skia_out" skia
+  (cd "$SKIA_ROOT" && bin/gn gen "$skia_out" --args="target_os=\"mac\" target_cpu=\"$skia_arch\" is_component_build=false is_debug=false is_official_build=true skia_use_metal=true skia_use_gl=false skia_use_vulkan=false skia_use_dawn=false skia_enable_tools=false skia_enable_ganesh=true skia_enable_pdf=false skia_enable_svg=false skia_use_system_expat=false skia_use_system_harfbuzz=false skia_use_system_icu=false skia_use_system_libjpeg_turbo=false skia_use_system_libpng=false skia_use_system_libwebp=false skia_use_system_zlib=false")
+  ninja -C "$skia_out" skia pathops
 
   cmake -S "$ROOT/native/SkiaNative.Avalonia" -B "$cmake_out" \
     -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_OSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-12.0}" \
     -DCMAKE_OSX_ARCHITECTURES="$cmake_arch" \
     -DSKIANATIVE_WITH_SKIA=ON \
     -DSKIANATIVE_SKIA_ROOT="$SKIA_ROOT" \

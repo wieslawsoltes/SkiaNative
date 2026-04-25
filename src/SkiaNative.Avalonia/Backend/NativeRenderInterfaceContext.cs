@@ -87,11 +87,13 @@ internal sealed class NativeRenderInterfaceContext : IPlatformRenderInterfaceCon
                 metal.Device,
                 metal.CommandQueue,
                 checked((ulong)(_options.MaxGpuResourceBytes ?? 0)),
-                _options.EnableDiagnostics ? 1 : 0);
+                _options.EnableDiagnostics ? 1 : 0,
+                (int)_options.GpuSubmitMode);
         }
 
         return NativeMethods.ContextCreateCpu(
             checked((ulong)(_options.MaxGpuResourceBytes ?? 0)),
-            _options.EnableDiagnostics ? 1 : 0);
+            _options.EnableDiagnostics ? 1 : 0,
+            (int)_options.GpuSubmitMode);
     }
 }

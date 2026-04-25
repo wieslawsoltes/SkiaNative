@@ -31,7 +31,10 @@ internal sealed class NativeFramebufferRenderTarget : IRenderTarget
 
         var framebuffer = _target.Lock(sceneInfo, out var lockProperties);
 
-        var nativeContext = NativeMethods.ContextCreateCpu(checked((ulong)(_options.MaxGpuResourceBytes ?? 0)), _options.EnableDiagnostics ? 1 : 0);
+        var nativeContext = NativeMethods.ContextCreateCpu(
+            checked((ulong)(_options.MaxGpuResourceBytes ?? 0)),
+            _options.EnableDiagnostics ? 1 : 0,
+            (int)_options.GpuSubmitMode);
         var nativeBitmap = NativeMethods.BitmapCreateRaster(framebuffer.Size.Width, framebuffer.Size.Height, framebuffer.Dpi.X, framebuffer.Dpi.Y);
         var previousFrameSeeded = false;
         unsafe
