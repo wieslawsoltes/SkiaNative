@@ -9,4 +9,7 @@ internal readonly record struct FrameStats(
     double FramesPerSecond,
     int NativeCommandCount,
     int NativeTransitionCount,
-    ulong GpuResourceBytes);
+    ulong GpuResourceBytes,
+    double NativeFlushMilliseconds,
+    double NativeSessionEndMilliseconds,
+    double PlatformPresentMilliseconds);

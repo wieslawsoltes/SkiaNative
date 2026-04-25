@@ -22,15 +22,24 @@ internal sealed class MainView : UserControl
     private readonly TextBlock _commandCountValue;
     private readonly TextBlock _transitionCountValue;
     private readonly TextBlock _gpuBytesValue;
+    private readonly TextBlock _nativeFlushValue;
+    private readonly TextBlock _nativeSessionEndValue;
+    private readonly TextBlock _platformPresentValue;
+    private readonly DateTime _modeInputEnabledAtUtc = DateTime.UtcNow.AddSeconds(2);
 
     public MainView()
     {
+        _viewModel.AnimateMotion = true;
+        _viewModel.MutateSplits = false;
+        _viewModel.UseCachedMesh = false;
         DataContext = _viewModel;
 
         _surface = new MotionMarkSurface
         {
             Complexity = _viewModel.Complexity,
             MutateSplits = _viewModel.MutateSplits,
+            UseCachedMesh = _viewModel.UseCachedMesh,
+            AnimateMotion = _viewModel.AnimateMotion,
             HorizontalAlignment = HorizontalAlignment.Stretch,
             VerticalAlignment = VerticalAlignment.Stretch
         };
@@ -45,6 +54,9 @@ internal sealed class MainView : UserControl
         _commandCountValue = MetricValue();
         _transitionCountValue = MetricValue();
         _gpuBytesValue = MetricValue();
+        _nativeFlushValue = MetricValue();
+        _nativeSessionEndValue = MetricValue();
+        _platformPresentValue = MetricValue();
 
         Content = BuildLayout();
         UpdateMetrics();
@@ -141,20 +153,32 @@ internal sealed class MainView : UserControl
             }
         };
 
-        var mutate = new CheckBox
-        {
-            Content = "Mutate path splits every frame",
-            IsChecked = _viewModel.MutateSplits,
-            Foreground = Brushes.White
-        };
-        mutate.PropertyChanged += (_, e) =>
-        {
-            if (e.Property == ToggleButton.IsCheckedProperty)
+        var animateMotion = ModeButton(
+            "Smooth animation",
+            () => _viewModel.AnimateMotion,
+            value =>
             {
-                _viewModel.MutateSplits = mutate.IsChecked == true;
-                _surface.MutateSplits = _viewModel.MutateSplits;
-            }
-        };
+                _viewModel.AnimateMotion = value;
+                _surface.AnimateMotion = value;
+            });
+
+        var mutate = ModeButton(
+            "Split mutation stress",
+            () => _viewModel.MutateSplits,
+            value =>
+            {
+                _viewModel.MutateSplits = value;
+                _surface.MutateSplits = value;
+            });
+
+        var cacheMesh = ModeButton(
+            "Cached path mesh",
+            () => _viewModel.UseCachedMesh,
+            value =>
+            {
+                _viewModel.UseCachedMesh = value;
+                _surface.UseCachedMesh = value;
+            });
 
         return new Border
         {
@@ -178,7 +202,9 @@ internal sealed class MainView : UserControl
                     },
                     slider,
                     MetricRow("Complexity", _complexityValue),
+                    animateMotion,
                     mutate,
+                    cacheMesh,
                     new Border
                     {
                         Height = 1,
@@ -207,6 +233,9 @@ internal sealed class MainView : UserControl
                     SectionTitle("SkiaNative"),
                     MetricRow("Commands", _commandCountValue),
                     MetricRow("Transitions", _transitionCountValue),
+                    MetricRow("Flush", _nativeFlushValue),
+                    MetricRow("Submit", _nativeSessionEndValue),
+                    MetricRow("Present", _platformPresentValue),
                     MetricRow("GPU cache", _gpuBytesValue)
                 }
             }
@@ -229,6 +258,9 @@ internal sealed class MainView : UserControl
         _fpsValue.Text = $"{_viewModel.FramesPerSecond:F1}";
         _commandCountValue.Text = _viewModel.NativeCommandCount.ToString("N0");
         _transitionCountValue.Text = _viewModel.NativeTransitionCount.ToString("N0");
+        _nativeFlushValue.Text = $"{_viewModel.NativeFlushMilliseconds:F2} ms";
+        _nativeSessionEndValue.Text = $"{_viewModel.NativeSessionEndMilliseconds:F2} ms";
+        _platformPresentValue.Text = $"{_viewModel.PlatformPresentMilliseconds:F2} ms";
         _gpuBytesValue.Text = FormatBytes(_viewModel.GpuResourceBytes);
     }
 
@@ -270,6 +302,44 @@ internal sealed class MainView : UserControl
             FontWeight = FontWeight.SemiBold,
             VerticalAlignment = VerticalAlignment.Center
         };
+    }
+
+    private Button ModeButton(string label, Func<bool> getValue, Action<bool> setValue)
+    {
+        var button = new Button
+        {
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            HorizontalContentAlignment = HorizontalAlignment.Center,
+            Padding = new Thickness(10, 7)
+        };
+
+        void Update()
+        {
+            var enabled = getValue();
+            button.Content = $"{label}: {(enabled ? "ON" : "OFF")}";
+            button.Background = new SolidColorBrush(enabled
+                ? Color.FromRgb(0, 127, 255)
+                : Color.FromRgb(31, 39, 53));
+            button.BorderBrush = new SolidColorBrush(enabled
+                ? Color.FromRgb(64, 170, 255)
+                : Color.FromRgb(75, 88, 112));
+            button.Foreground = Brushes.White;
+        }
+
+        button.Click += (_, _) =>
+        {
+            if (DateTime.UtcNow < _modeInputEnabledAtUtc)
+            {
+                Update();
+                return;
+            }
+
+            setValue(!getValue());
+            Update();
+        };
+
+        Update();
+        return button;
     }
 
     private static string FormatBytes(ulong bytes)

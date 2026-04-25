@@ -34,6 +34,7 @@ internal static class Program
                 EnableCpuFallback = true,
                 InitialCommandBufferCapacity = 16_384,
                 MaxGpuResourceBytes = 32L * 1024 * 1024,
+                GpuSubmitMode = global::SkiaNative.Avalonia.SkiaNativeGpuSubmitMode.FlushAndSubmit,
                 NativeLibraryPath = TryFindNativeLibrary()
             })
             .LogToTrace();

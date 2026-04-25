@@ -16,7 +16,12 @@ internal sealed class MainWindowViewModel : INotifyPropertyChanged
     private int _nativeCommandCount;
     private int _nativeTransitionCount;
     private ulong _gpuResourceBytes;
+    private double _nativeFlushMs;
+    private double _nativeSessionEndMs;
+    private double _platformPresentMs;
     private bool _mutateSplits;
+    private bool _useCachedMesh;
+    private bool _animateMotion = true;
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
@@ -42,6 +47,32 @@ internal sealed class MainWindowViewModel : INotifyPropertyChanged
             if (_mutateSplits != value)
             {
                 _mutateSplits = value;
+                OnPropertyChanged();
+            }
+        }
+    }
+
+    public bool UseCachedMesh
+    {
+        get => _useCachedMesh;
+        set
+        {
+            if (_useCachedMesh != value)
+            {
+                _useCachedMesh = value;
+                OnPropertyChanged();
+            }
+        }
+    }
+
+    public bool AnimateMotion
+    {
+        get => _animateMotion;
+        set
+        {
+            if (_animateMotion != value)
+            {
+                _animateMotion = value;
                 OnPropertyChanged();
             }
         }
@@ -151,6 +182,45 @@ internal sealed class MainWindowViewModel : INotifyPropertyChanged
         }
     }
 
+    public double NativeFlushMilliseconds
+    {
+        get => _nativeFlushMs;
+        private set
+        {
+            if (Math.Abs(_nativeFlushMs - value) > 0.0001)
+            {
+                _nativeFlushMs = value;
+                OnPropertyChanged();
+            }
+        }
+    }
+
+    public double NativeSessionEndMilliseconds
+    {
+        get => _nativeSessionEndMs;
+        private set
+        {
+            if (Math.Abs(_nativeSessionEndMs - value) > 0.0001)
+            {
+                _nativeSessionEndMs = value;
+                OnPropertyChanged();
+            }
+        }
+    }
+
+    public double PlatformPresentMilliseconds
+    {
+        get => _platformPresentMs;
+        private set
+        {
+            if (Math.Abs(_platformPresentMs - value) > 0.0001)
+            {
+                _platformPresentMs = value;
+                OnPropertyChanged();
+            }
+        }
+    }
+
     public void Update(FrameStats stats)
     {
         Complexity = stats.Complexity;
@@ -162,6 +232,9 @@ internal sealed class MainWindowViewModel : INotifyPropertyChanged
         NativeCommandCount = stats.NativeCommandCount;
         NativeTransitionCount = stats.NativeTransitionCount;
         GpuResourceBytes = stats.GpuResourceBytes;
+        NativeFlushMilliseconds = stats.NativeFlushMilliseconds;
+        NativeSessionEndMilliseconds = stats.NativeSessionEndMilliseconds;
+        PlatformPresentMilliseconds = stats.PlatformPresentMilliseconds;
     }
 
     private void OnPropertyChanged([CallerMemberName] string? propertyName = null)
