@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Avalonia.Media;
 using Avalonia.Media.Imaging;
 using Avalonia.Media.Immutable;
@@ -185,6 +186,8 @@ internal sealed class NativeDrawingContext : IDrawingContextImpl, IDrawingContex
     {
         CommandBufferFlushResult result = default;
         NativeResourceCacheUsage resourceCacheUsage = default;
+        var timing = default(NativeFrameTiming);
+        var shouldPublishDiagnostics = SkiaNativeDiagnostics.ShouldPublish(_options);
 
         try
         {
@@ -193,18 +196,39 @@ internal sealed class NativeDrawingContext : IDrawingContextImpl, IDrawingContex
         finally
         {
             _commands.Dispose();
-            _session.Dispose();
-            _platformSession?.Dispose();
 
+            var sessionEndStarted = Stopwatch.GetTimestamp();
+            _session.Dispose();
+            var sessionEndElapsed = shouldPublishDiagnostics ? GetElapsed(sessionEndStarted) : default;
+
+            var platformPresentStarted = Stopwatch.GetTimestamp();
+            _platformSession?.Dispose();
+            var platformPresentElapsed = shouldPublishDiagnostics ? GetElapsed(platformPresentStarted) : default;
+
+            TimeSpan gpuCleanupElapsed = default;
             if (_options.PurgeGpuResourcesAfterFrame && _gpuContext is { IsInvalid: false })
             {
+                var gpuCleanupStarted = Stopwatch.GetTimestamp();
                 NativeMethods.ContextPurgeUnlockedResources(_gpuContext);
+                gpuCleanupElapsed = shouldPublishDiagnostics ? GetElapsed(gpuCleanupStarted) : default;
             }
 
-            resourceCacheUsage = GetResourceCacheUsage();
+            TimeSpan diagnosticsElapsed = default;
+            if (shouldPublishDiagnostics)
+            {
+                var diagnosticsStarted = Stopwatch.GetTimestamp();
+                resourceCacheUsage = GetResourceCacheUsage();
+                diagnosticsElapsed = GetElapsed(diagnosticsStarted);
+            }
+
+            timing = new NativeFrameTiming(
+                sessionEndElapsed,
+                platformPresentElapsed,
+                gpuCleanupElapsed,
+                diagnosticsElapsed);
         }
 
-        SkiaNativeDiagnostics.Publish(_options, result, resourceCacheUsage);
+        SkiaNativeDiagnostics.Publish(_options, result, resourceCacheUsage, timing);
     }
 
     private NativeResourceCacheUsage GetResourceCacheUsage()
@@ -255,4 +279,7 @@ internal sealed class NativeDrawingContext : IDrawingContextImpl, IDrawingContex
             first.NativeTransitionCount + second.NativeTransitionCount,
             first.FlushElapsed + second.FlushElapsed,
             first.NativeResult != 0 ? first.NativeResult : second.NativeResult);
+
+    private static TimeSpan GetElapsed(long startTimestamp) =>
+        Stopwatch.GetElapsedTime(startTimestamp);
 }

@@ -9,7 +9,11 @@ public readonly record struct SkiaNativeFrameDiagnostics(
     int GpuResourceCount,
     ulong GpuResourceBytes,
     ulong GpuPurgeableBytes,
-    ulong GpuResourceLimit);
+    ulong GpuResourceLimit,
+    TimeSpan SessionEndElapsed,
+    TimeSpan PlatformPresentElapsed,
+    TimeSpan GpuCleanupElapsed,
+    TimeSpan DiagnosticsElapsed);
 
 public static class SkiaNativeDiagnostics
 {
@@ -17,9 +21,16 @@ public static class SkiaNativeDiagnostics
 
     public static event Action<SkiaNativeFrameDiagnostics>? FrameRendered;
 
-    internal static void Publish(SkiaNativeOptions options, CommandBufferFlushResult result, NativeResourceCacheUsage resourceCacheUsage)
+    internal static bool ShouldPublish(SkiaNativeOptions options) =>
+        options.EnableDiagnostics || options.DiagnosticsCallback is not null || FrameRendered is not null;
+
+    internal static void Publish(
+        SkiaNativeOptions options,
+        CommandBufferFlushResult result,
+        NativeResourceCacheUsage resourceCacheUsage,
+        NativeFrameTiming timing)
     {
-        if (!options.EnableDiagnostics && options.DiagnosticsCallback is null && FrameRendered is null)
+        if (!ShouldPublish(options))
         {
             return;
         }
@@ -33,7 +44,11 @@ public static class SkiaNativeDiagnostics
             resourceCacheUsage.ResourceCount,
             resourceCacheUsage.ResourceBytes,
             resourceCacheUsage.PurgeableBytes,
-            resourceCacheUsage.ResourceLimit);
+            resourceCacheUsage.ResourceLimit,
+            timing.SessionEndElapsed,
+            timing.PlatformPresentElapsed,
+            timing.GpuCleanupElapsed,
+            timing.DiagnosticsElapsed);
 
         options.DiagnosticsCallback?.Invoke(diagnostics);
         FrameRendered?.Invoke(diagnostics);
@@ -45,3 +60,9 @@ internal readonly record struct NativeResourceCacheUsage(
     ulong ResourceBytes,
     ulong PurgeableBytes,
     ulong ResourceLimit);
+
+internal readonly record struct NativeFrameTiming(
+    TimeSpan SessionEndElapsed,
+    TimeSpan PlatformPresentElapsed,
+    TimeSpan GpuCleanupElapsed,
+    TimeSpan DiagnosticsElapsed);

@@ -550,8 +550,8 @@ internal static class Program
                 EnableDiagnostics = true,
                 EnableCpuFallback = true,
                 InitialCommandBufferCapacity = 1024,
-                MaxGpuResourceBytes = 4L * 1024 * 1024,
-                PurgeGpuResourcesAfterFrame = true,
+                MaxGpuResourceBytes = SkiaNativeOptions.DefaultMaxGpuResourceBytes,
+                PurgeGpuResourcesAfterFrame = false,
                 NativeLibraryPath = TryFindNativeLibrary(),
                 DiagnosticsCallback = smokeMode ? static frame =>
                 {
@@ -562,6 +562,10 @@ internal static class Program
                         $"transitions={frame.NativeTransitionCount} " +
                         $"nativeResult={frame.NativeResult} " +
                         $"flushMs={frame.FlushElapsed.TotalMilliseconds:0.###} " +
+                        $"sessionEndMs={frame.SessionEndElapsed.TotalMilliseconds:0.###} " +
+                        $"platformPresentMs={frame.PlatformPresentElapsed.TotalMilliseconds:0.###} " +
+                        $"gpuCleanupMs={frame.GpuCleanupElapsed.TotalMilliseconds:0.###} " +
+                        $"diagnosticsMs={frame.DiagnosticsElapsed.TotalMilliseconds:0.###} " +
                         $"gpuBytes={frame.GpuResourceBytes} " +
                         $"gpuPurgeableBytes={frame.GpuPurgeableBytes} " +
                         $"gpuCount={frame.GpuResourceCount} " +
