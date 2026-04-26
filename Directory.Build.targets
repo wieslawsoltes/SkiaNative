@@ -1,0 +1,21 @@
+<Project>
+  <PropertyGroup Condition="'$(Configuration)' == 'Release' and '$(SkiaNativeDisableReleaseWarningsAsErrors)' == 'true'">
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <MSBuildTreatWarningsAsErrors>false</MSBuildTreatWarningsAsErrors>
+    <WarningsAsErrors />
+    <WarningsNotAsErrors>$(WarningsNotAsErrors);NU1901;NU1902;NU1903;NU1904</WarningsNotAsErrors>
+
+    <!--
+      dotnet restore walks external Avalonia project references before sample
+      project-reference metadata is applied. Carry the sample warning policy into
+      that restore graph so Avalonia NU190x audit warnings remain warnings.
+    -->
+    <_GenerateRestoreGraphProjectEntryInputProperties>
+      $(_GenerateRestoreGraphProjectEntryInputProperties);
+      AvnTreatWarningsAsErrors=false;
+      TreatWarningsAsErrors=false;
+      MSBuildTreatWarningsAsErrors=false;
+      WarningsNotAsErrors=NU1901%3BNU1902%3BNU1903%3BNU1904
+    </_GenerateRestoreGraphProjectEntryInputProperties>
+  </PropertyGroup>
+</Project>
