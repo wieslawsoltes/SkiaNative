@@ -5,4 +5,5 @@
   <Project Path="benchmarks/SkiaNative.Avalonia.Benchmarks/SkiaNative.Avalonia.Benchmarks.csproj" />
   <Project Path="samples/SkiaNative.Avalonia.Sample/SkiaNative.Avalonia.Sample.csproj" />
   <Project Path="samples/MotionMark.SkiaNative.Avalonia/MotionMark.SkiaNative.Avalonia.csproj" />
+  <Project Path="samples/MeshParticles.SkiaNative.Avalonia/MeshParticles.SkiaNative.Avalonia.csproj" />
 </Solution>

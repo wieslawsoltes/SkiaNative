@@ -17,6 +17,7 @@ Implemented areas include:
 - Native Skia paths, geometry operations, path measuring, widened geometry, and hit testing.
 - Native bitmap decode, upload, draw, readback, resize, and PNG encoding.
 - Native glyph-run rasterization from Avalonia/HarfBuzz-shaped text.
+- Native `SkMeshSpecification`, GPU-backed mesh vertex/index buffers, uniform reflection, and `SkCanvas::drawMesh` direct rendering.
 - Solid, linear, radial, conic, image, and initial scene-content brush paths.
 - Opacity layers, opacity masks, styled strokes, and basic box shadows.
 - Diagnostics for flush timing, command count, transition count, native result, and Ganesh resource-cache usage.
@@ -203,6 +204,16 @@ dotnet run --project samples/MotionMark.SkiaNative.Avalonia/MotionMark.SkiaNativ
 ```
 
 This sample intentionally does not reference SkiaSharp and does not render its workload through Avalonia `Geometry` / `Pen` primitives. It prepares `SkiaNativePathCommand` snapshots, submits an Avalonia `ICustomDrawOperation` only for render-thread scheduling, leases `ISkiaNativeApiLeaseFeature`, and encodes the background, grid, and path strokes directly into the SkiaNative command buffer. With the SkiaNative backend on macOS, those commands target the Metal/Ganesh GPU surface and execute through the native C++ Skia path. The UI exposes complexity, FastSkiaSharp parity mode, optional per-frame path split mutation, frame timing, native command count, transition count, and GPU cache usage.
+
+### Mesh Particles Sample
+
+Run the custom mesh shader sample:
+
+```bash
+dotnet run --project samples/MeshParticles.SkiaNative.Avalonia/MeshParticles.SkiaNative.Avalonia.csproj
+```
+
+This sample demonstrates the high-performance mesh API inspired by the new Skia/SkiaSharp `SkMesh` surface: a reusable `SkiaNativeMeshSpecification`, GPU-backed vertex and index buffers, reflected uniform packing, per-frame `Span<T>` vertex updates, and one direct `drawMesh` call from an Avalonia custom draw operation. It renders an animated particle field using Skia mesh vertex and fragment SkSL rather than Avalonia shapes or SkiaSharp.
 
 ## Validation
 

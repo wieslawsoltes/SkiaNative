@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <SkiaNativeDisableReleaseWarningsAsErrors>true</SkiaNativeDisableReleaseWarningsAsErrors>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <MSBuildTreatWarningsAsErrors>false</MSBuildTreatWarningsAsErrors>
+    <WarningsAsErrors />
+    <WarningsNotAsErrors>$(WarningsNotAsErrors);NU1901;NU1902;NU1903;NU1904</WarningsNotAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/SkiaNative.Avalonia/SkiaNative.Avalonia.csproj" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(AvaloniaSourceRoot)' != ''">
+    <ProjectReference Include="$(AvaloniaSourceRoot)/src/Avalonia.Desktop/Avalonia.Desktop.csproj" Properties="TargetFramework=net10.0;PackAvaloniaNative=false;AvnTreatWarningsAsErrors=false;TreatWarningsAsErrors=false;MSBuildTreatWarningsAsErrors=false;WarningsAsErrors=;WarningsNotAsErrors=NU1901%3BNU1902%3BNU1903%3BNU1904" />
+    <ProjectReference Include="$(AvaloniaSourceRoot)/src/Avalonia.Themes.Simple/Avalonia.Themes.Simple.csproj" Properties="TargetFramework=net10.0;PackAvaloniaNative=false;AvnTreatWarningsAsErrors=false;TreatWarningsAsErrors=false;MSBuildTreatWarningsAsErrors=false;WarningsAsErrors=;WarningsNotAsErrors=NU1901%3BNU1902%3BNU1903%3BNU1904" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(AvaloniaSourceRoot)' == ''">
+    <PackageReference Include="Avalonia.Desktop" />
+    <PackageReference Include="Avalonia.Themes.Simple" />
+  </ItemGroup>
+</Project>
