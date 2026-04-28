@@ -282,13 +282,14 @@ float3 hsv2rgb(float h) {
 
 float2 main(const Varyings v, out half4 color) {
     float r = length(v.local);
-    float edge = smoothstep(1.0, 0.08, r);
+    float edge = 1.0 - smoothstep(0.78, 1.0, r);
     float core = exp(-r * r * 5.0);
     float ring = 0.5 + 0.5 * sin(24.0 * (1.0 - r) + v.phase + u_time * 4.0);
     float pulse = 0.72 + 0.28 * sin(u_time * 2.7 + v.phase);
     float3 rgb = hsv2rgb(fract(v.hue + 0.05 * sin(u_time + v.phase)));
     float intensity = core * 1.35 + ring * 0.28 + pulse * 0.18;
-    color = half4(half3(rgb * intensity), half(v.alpha * edge));
+    float alpha = clamp(v.alpha * edge, 0.0, 1.0);
+    color = half4(half3(rgb * intensity * alpha), half(alpha));
     return v.position;
 }
 """;
