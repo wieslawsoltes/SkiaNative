@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <string_view>
 #include <vector>
 
 #if defined(__APPLE__)
@@ -26,6 +27,7 @@ static_assert(sizeof(skn_path_command_t) == 40, "skn_path_command_t must stay AB
 
 #if defined(SKIANATIVE_WITH_SKIA)
 #include "include/core/SkCanvas.h"
+#include "include/core/SkAlphaType.h"
 #include "include/core/SkBlendMode.h"
 #include "include/core/SkClipOp.h"
 #include "include/core/SkColor.h"
@@ -36,6 +38,7 @@ static_assert(sizeof(skn_path_command_t) == 40, "skn_path_command_t must stay AB
 #include "include/core/SkFontTypes.h"
 #include "include/core/SkImage.h"
 #include "include/core/SkMatrix.h"
+#include "include/core/SkMesh.h"
 #include "include/core/SkPaint.h"
 #include "include/core/SkPath.h"
 #include "include/core/SkPathBuilder.h"
@@ -59,6 +62,7 @@ static_assert(sizeof(skn_path_command_t) == 40, "skn_path_command_t must stay AB
 #include "include/gpu/ganesh/GrContextOptions.h"
 #include "include/gpu/ganesh/GrBackendSurface.h"
 #include "include/gpu/ganesh/GrDirectContext.h"
+#include "include/gpu/ganesh/SkMeshGanesh.h"
 #include "include/gpu/ganesh/SkSurfaceGanesh.h"
 #include "include/gpu/ganesh/GrTypes.h"
 #include "include/gpu/ganesh/mtl/GrMtlBackendContext.h"
@@ -113,6 +117,12 @@ enum CommandKind : uint32_t {
     DrawPathStream = 20,
 };
 
+static void clear_error_message(char* buffer, int capacity) {
+    if (buffer != nullptr && capacity > 0) {
+        buffer[0] = '\0';
+    }
+}
+
 #if defined(SKIANATIVE_WITH_SKIA)
 struct OpacityMaskFrame {
     SkMatrix transform;
@@ -131,6 +141,19 @@ static SkPaint make_paint(const skn_color_t& color, SkPaint::Style style, float 
     paint.setStyle(style);
     paint.setStrokeWidth(std::max(stroke_width, 0.0f));
     return paint;
+}
+
+static void copy_error_message(const SkString& error, char* buffer, int capacity) {
+    if (buffer == nullptr || capacity <= 0) {
+        return;
+    }
+
+    const auto length = std::min<size_t>(static_cast<size_t>(capacity - 1), error.size());
+    if (length > 0) {
+        std::memcpy(buffer, error.c_str(), length);
+    }
+
+    buffer[length] = '\0';
 }
 
 static SkPaint make_command_paint(const skn_color_t& color, SkPaint::Style style, float stroke_width, skn_shader_t* shader, skn_stroke_t* stroke);
@@ -740,6 +763,25 @@ struct skn_path_stream_mesh {
     int drawn_segments = 0;
 #if defined(SKIANATIVE_WITH_SKIA)
     std::vector<sk_sp<SkVertices>> vertex_batches;
+#endif
+};
+
+struct skn_mesh_spec {
+#if defined(SKIANATIVE_WITH_SKIA)
+    sk_sp<SkMeshSpecification> specification;
+#endif
+};
+
+struct skn_mesh {
+    int vertex_count = 0;
+    int index_count = 0;
+#if defined(SKIANATIVE_WITH_SKIA)
+    sk_sp<SkMeshSpecification> specification;
+    SkMesh::Mode mode = SkMesh::Mode::kTriangles;
+    sk_sp<SkMesh::VertexBuffer> vertex_buffer;
+    sk_sp<SkMesh::IndexBuffer> index_buffer;
+    sk_sp<const SkData> uniforms;
+    SkRect bounds = SkRect::MakeEmpty();
 #endif
 };
 
@@ -1477,6 +1519,62 @@ SKN_EXPORT int skn_session_draw_path_stream_mesh(skn_session_t* session, skn_pat
 #endif
 }
 
+SKN_EXPORT int skn_session_draw_mesh(skn_session_t* session, skn_mesh_t* mesh, skn_shader_t* shader, skn_color_t color, uint32_t flags) {
+    ScopedAutoreleasePool autorelease_pool;
+    if (session == nullptr || mesh == nullptr) {
+        return -1;
+    }
+
+#if defined(SKIANATIVE_WITH_SKIA)
+    if (!session->surface || !mesh->specification || !mesh->vertex_buffer) {
+        return 0;
+    }
+
+    auto uniform_data = mesh->uniforms ? mesh->uniforms : SkData::MakeEmpty();
+    SkSpan<SkMesh::ChildPtr> children;
+    SkMesh::Result result = mesh->index_buffer
+        ? SkMesh::MakeIndexed(
+            mesh->specification,
+            mesh->mode,
+            mesh->vertex_buffer,
+            static_cast<size_t>(mesh->vertex_count),
+            0,
+            mesh->index_buffer,
+            static_cast<size_t>(mesh->index_count),
+            0,
+            uniform_data,
+            children,
+            mesh->bounds)
+        : SkMesh::Make(
+            mesh->specification,
+            mesh->mode,
+            mesh->vertex_buffer,
+            static_cast<size_t>(mesh->vertex_count),
+            0,
+            uniform_data,
+            children,
+            mesh->bounds);
+
+    if (!result.mesh.isValid()) {
+        return 0;
+    }
+
+    auto paint = make_paint(color, SkPaint::kFill_Style);
+    apply_shape_paint_flags(paint, flags);
+    if (shader != nullptr && shader->shader) {
+        paint.setShader(shader->shader);
+    }
+
+    session->surface->getCanvas()->drawMesh(result.mesh, nullptr, paint);
+    return 1;
+#else
+    (void)shader;
+    (void)color;
+    (void)flags;
+    return 1;
+#endif
+}
+
 SKN_EXPORT int skn_session_draw_path_fills(skn_session_t* session, const skn_path_fill_command_t* commands, int command_count) {
     ScopedAutoreleasePool autorelease_pool;
     if (session == nullptr || commands == nullptr || command_count < 0) {
@@ -2161,6 +2259,316 @@ SKN_EXPORT skn_path_stream_mesh_t* skn_path_stream_mesh_create(const skn_path_st
 }
 
 SKN_EXPORT void skn_path_stream_mesh_destroy(skn_path_stream_mesh_t* mesh) {
+    delete mesh;
+}
+
+#if defined(SKIANATIVE_WITH_SKIA)
+static SkMeshSpecification::Attribute::Type to_sk_mesh_attribute_type(uint32_t type) {
+    switch (type) {
+        case SKN_MESH_ATTRIBUTE_FLOAT2:
+            return SkMeshSpecification::Attribute::Type::kFloat2;
+        case SKN_MESH_ATTRIBUTE_FLOAT3:
+            return SkMeshSpecification::Attribute::Type::kFloat3;
+        case SKN_MESH_ATTRIBUTE_FLOAT4:
+            return SkMeshSpecification::Attribute::Type::kFloat4;
+        case SKN_MESH_ATTRIBUTE_UBYTE4_UNORM:
+            return SkMeshSpecification::Attribute::Type::kUByte4_unorm;
+        case SKN_MESH_ATTRIBUTE_FLOAT:
+        default:
+            return SkMeshSpecification::Attribute::Type::kFloat;
+    }
+}
+
+static SkMeshSpecification::Varying::Type to_sk_mesh_varying_type(uint32_t type) {
+    switch (type) {
+        case SKN_MESH_VARYING_FLOAT2:
+            return SkMeshSpecification::Varying::Type::kFloat2;
+        case SKN_MESH_VARYING_FLOAT3:
+            return SkMeshSpecification::Varying::Type::kFloat3;
+        case SKN_MESH_VARYING_FLOAT4:
+            return SkMeshSpecification::Varying::Type::kFloat4;
+        case SKN_MESH_VARYING_HALF:
+            return SkMeshSpecification::Varying::Type::kHalf;
+        case SKN_MESH_VARYING_HALF2:
+            return SkMeshSpecification::Varying::Type::kHalf2;
+        case SKN_MESH_VARYING_HALF3:
+            return SkMeshSpecification::Varying::Type::kHalf3;
+        case SKN_MESH_VARYING_HALF4:
+            return SkMeshSpecification::Varying::Type::kHalf4;
+        case SKN_MESH_VARYING_FLOAT:
+        default:
+            return SkMeshSpecification::Varying::Type::kFloat;
+    }
+}
+
+static SkMesh::Mode to_sk_mesh_mode(int mode) {
+    return mode == SKN_MESH_MODE_TRIANGLE_STRIP ? SkMesh::Mode::kTriangleStrip : SkMesh::Mode::kTriangles;
+}
+
+static GrDirectContext* get_direct_context(skn_context_t* context) {
+    return context != nullptr ? context->direct_context.get() : nullptr;
+}
+
+static sk_sp<const SkData> make_uniform_data(const void* uniforms, int uniform_bytes) {
+    if (uniform_bytes <= 0) {
+        return SkData::MakeEmpty();
+    }
+
+    if (uniforms == nullptr) {
+        return nullptr;
+    }
+
+    return SkData::MakeWithCopy(uniforms, static_cast<size_t>(uniform_bytes));
+}
+#endif
+
+SKN_EXPORT skn_mesh_spec_t* skn_mesh_spec_create(const skn_mesh_attribute_t* attributes, int attribute_count, int vertex_stride, const skn_mesh_varying_t* varyings, int varying_count, const char* vertex_sksl, const char* fragment_sksl, char* error, int error_capacity) {
+    clear_error_message(error, error_capacity);
+    if (attributes == nullptr || attribute_count <= 0 || vertex_stride <= 0 || vertex_sksl == nullptr || fragment_sksl == nullptr || varying_count < 0) {
+        return nullptr;
+    }
+
+    if (varying_count > 0 && varyings == nullptr) {
+        return nullptr;
+    }
+
+#if defined(SKIANATIVE_WITH_SKIA)
+    std::vector<SkMeshSpecification::Attribute> native_attributes;
+    native_attributes.reserve(static_cast<size_t>(attribute_count));
+    for (int i = 0; i < attribute_count; ++i) {
+        const auto& attribute = attributes[i];
+        native_attributes.push_back(SkMeshSpecification::Attribute{
+            to_sk_mesh_attribute_type(attribute.type),
+            static_cast<size_t>(attribute.offset),
+            SkString(attribute.name != nullptr ? attribute.name : "")});
+    }
+
+    std::vector<SkMeshSpecification::Varying> native_varyings;
+    native_varyings.reserve(static_cast<size_t>(varying_count));
+    for (int i = 0; i < varying_count; ++i) {
+        const auto& varying = varyings[i];
+        native_varyings.push_back(SkMeshSpecification::Varying{
+            to_sk_mesh_varying_type(varying.type),
+            SkString(varying.name != nullptr ? varying.name : "")});
+    }
+
+    auto result = SkMeshSpecification::Make(
+        SkSpan<const SkMeshSpecification::Attribute>(native_attributes.data(), native_attributes.size()),
+        static_cast<size_t>(vertex_stride),
+        SkSpan<const SkMeshSpecification::Varying>(native_varyings.data(), native_varyings.size()),
+        SkString(vertex_sksl),
+        SkString(fragment_sksl),
+        SkColorSpace::MakeSRGB(),
+        kPremul_SkAlphaType);
+
+    if (!result.specification) {
+        copy_error_message(result.error, error, error_capacity);
+        return nullptr;
+    }
+
+    auto* spec = new skn_mesh_spec_t();
+    spec->specification = std::move(result.specification);
+    return spec;
+#else
+    (void)attribute_count;
+    (void)vertex_stride;
+    (void)varyings;
+    (void)vertex_sksl;
+    (void)fragment_sksl;
+    return new skn_mesh_spec_t();
+#endif
+}
+
+SKN_EXPORT int skn_mesh_spec_get_stride(skn_mesh_spec_t* spec) {
+    if (spec == nullptr) {
+        return 0;
+    }
+
+#if defined(SKIANATIVE_WITH_SKIA)
+    return spec->specification ? static_cast<int>(spec->specification->stride()) : 0;
+#else
+    return 0;
+#endif
+}
+
+SKN_EXPORT int skn_mesh_spec_get_uniform_size(skn_mesh_spec_t* spec) {
+    if (spec == nullptr) {
+        return 0;
+    }
+
+#if defined(SKIANATIVE_WITH_SKIA)
+    return spec->specification ? static_cast<int>(spec->specification->uniformSize()) : 0;
+#else
+    return 0;
+#endif
+}
+
+SKN_EXPORT int skn_mesh_spec_get_uniform(skn_mesh_spec_t* spec, const char* name, skn_mesh_uniform_info_t* info) {
+    if (spec == nullptr || name == nullptr || info == nullptr) {
+        return 0;
+    }
+
+#if defined(SKIANATIVE_WITH_SKIA)
+    if (!spec->specification) {
+        return 0;
+    }
+
+    auto* uniform = spec->specification->findUniform(std::string_view(name));
+    if (uniform == nullptr) {
+        return 0;
+    }
+
+    info->type = static_cast<uint32_t>(uniform->type);
+    info->count = static_cast<uint32_t>(uniform->count);
+    info->flags = static_cast<uint32_t>(uniform->flags);
+    info->offset = static_cast<uint32_t>(uniform->offset);
+    info->size = static_cast<uint32_t>(uniform->sizeInBytes());
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+SKN_EXPORT void skn_mesh_spec_destroy(skn_mesh_spec_t* spec) {
+    delete spec;
+}
+
+SKN_EXPORT skn_mesh_t* skn_mesh_create(skn_context_t* context, skn_mesh_spec_t* spec, int mode, const void* vertices, int vertex_bytes, int vertex_count, const uint16_t* indices, int index_count, const void* uniforms, int uniform_bytes, float left, float top, float right, float bottom) {
+    if (spec == nullptr || vertices == nullptr || vertex_bytes <= 0 || vertex_count < 3 || index_count < 0) {
+        return nullptr;
+    }
+
+#if defined(SKIANATIVE_WITH_SKIA)
+    if (!spec->specification) {
+        return nullptr;
+    }
+
+    auto* direct_context = get_direct_context(context);
+    auto vertex_buffer = SkMeshes::MakeVertexBuffer(direct_context, vertices, static_cast<size_t>(vertex_bytes));
+    if (!vertex_buffer) {
+        return nullptr;
+    }
+
+    sk_sp<SkMesh::IndexBuffer> index_buffer;
+    if (indices != nullptr && index_count > 0) {
+        index_buffer = SkMeshes::MakeIndexBuffer(direct_context, indices, static_cast<size_t>(index_count) * sizeof(uint16_t));
+        if (!index_buffer) {
+            return nullptr;
+        }
+    }
+
+    auto uniform_data = make_uniform_data(uniforms, uniform_bytes);
+    if (uniform_bytes > 0 && !uniform_data) {
+        return nullptr;
+    }
+
+    auto* mesh = new skn_mesh_t();
+    mesh->specification = spec->specification;
+    mesh->mode = to_sk_mesh_mode(mode);
+    mesh->vertex_buffer = std::move(vertex_buffer);
+    mesh->index_buffer = std::move(index_buffer);
+    mesh->vertex_count = vertex_count;
+    mesh->index_count = indices != nullptr ? index_count : 0;
+    mesh->uniforms = std::move(uniform_data);
+    mesh->bounds = SkRect::MakeLTRB(left, top, right, bottom);
+    return mesh;
+#else
+    (void)context;
+    (void)mode;
+    (void)vertex_bytes;
+    (void)vertex_count;
+    (void)indices;
+    (void)index_count;
+    (void)uniforms;
+    (void)uniform_bytes;
+    (void)left;
+    (void)top;
+    (void)right;
+    (void)bottom;
+    return new skn_mesh_t();
+#endif
+}
+
+SKN_EXPORT int skn_mesh_update_vertices(skn_context_t* context, skn_mesh_t* mesh, const void* vertices, int byte_offset, int byte_count, int vertex_count) {
+    if (mesh == nullptr || vertices == nullptr || byte_offset < 0 || byte_count <= 0 || vertex_count < 0) {
+        return 0;
+    }
+
+#if defined(SKIANATIVE_WITH_SKIA)
+    if (!mesh->vertex_buffer) {
+        return 0;
+    }
+
+    if (!mesh->vertex_buffer->update(get_direct_context(context), vertices, static_cast<size_t>(byte_offset), static_cast<size_t>(byte_count))) {
+        return 0;
+    }
+#else
+    (void)context;
+    (void)byte_offset;
+    (void)byte_count;
+#endif
+    mesh->vertex_count = vertex_count;
+    return 1;
+}
+
+SKN_EXPORT int skn_mesh_update_indices(skn_context_t* context, skn_mesh_t* mesh, const uint16_t* indices, int index_offset, int index_count) {
+    if (mesh == nullptr || indices == nullptr || index_offset < 0 || index_count < 3) {
+        return 0;
+    }
+
+#if defined(SKIANATIVE_WITH_SKIA)
+    if (!mesh->index_buffer) {
+        return 0;
+    }
+
+    const auto byte_offset = static_cast<size_t>(index_offset) * sizeof(uint16_t);
+    const auto byte_count = static_cast<size_t>(index_count) * sizeof(uint16_t);
+    if (!mesh->index_buffer->update(get_direct_context(context), indices, byte_offset, byte_count)) {
+        return 0;
+    }
+#else
+    (void)context;
+    (void)index_offset;
+#endif
+    mesh->index_count = index_count;
+    return 1;
+}
+
+SKN_EXPORT int skn_mesh_update_uniforms(skn_mesh_t* mesh, const void* uniforms, int uniform_bytes) {
+    if (mesh == nullptr || uniform_bytes < 0) {
+        return 0;
+    }
+
+#if defined(SKIANATIVE_WITH_SKIA)
+    auto uniform_data = make_uniform_data(uniforms, uniform_bytes);
+    if (uniform_bytes > 0 && !uniform_data) {
+        return 0;
+    }
+
+    mesh->uniforms = std::move(uniform_data);
+#else
+    (void)uniforms;
+#endif
+    return 1;
+}
+
+SKN_EXPORT int skn_mesh_set_bounds(skn_mesh_t* mesh, float left, float top, float right, float bottom) {
+    if (mesh == nullptr) {
+        return 0;
+    }
+
+#if defined(SKIANATIVE_WITH_SKIA)
+    mesh->bounds = SkRect::MakeLTRB(left, top, right, bottom);
+#else
+    (void)left;
+    (void)top;
+    (void)right;
+    (void)bottom;
+#endif
+    return 1;
+}
+
+SKN_EXPORT void skn_mesh_destroy(skn_mesh_t* mesh) {
     delete mesh;
 }
 
