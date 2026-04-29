@@ -238,6 +238,16 @@ The bootstrap script patches the current PR source to avoid the observed `SKPath
 
 If PR 3779 publishes a newer package version, pass `-p:SkiaSharpPr3779Version=<version>`. If the package folder is not under `~/.skiasharp/hives/pr-3779/packages`, pass `-p:SkiaSharpPr3779Packages=/absolute/path/to/packages`.
 
+### Mesh Arena SkiaSharp Uno Sample
+
+Run the game-style Uno Platform mesh sample after installing the same SkiaSharp PR 3779 package artifacts:
+
+```bash
+dotnet run --project samples/MeshArena.SkiaSharp.Uno/MeshArena.SkiaSharp.Uno/MeshArena.SkiaSharp.Uno.csproj
+```
+
+This sample researches and applies native Skia `SkMesh` usage patterns in an original luminous forest platformer named Luma Grove. It uses three mesh passes: an indexed parallax forest grid, a non-indexed `SKMeshMode.TriangleStrip` spirit aura trail, and an indexed sprite/entity batch for platforms, foliage, the spirit player, light seed collectibles, shadow wisps, thorn hazards, and particles. A/D or arrows move, Space/W/Up jumps, Shift/Enter or mouse click dashes, S/Down slows on ledges, and R respawns. The sample uses original procedural mesh/shader artwork and no fallback renderer.
+
 ## Validation
 
 ### Binding Benchmarks
