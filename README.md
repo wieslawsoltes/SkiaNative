@@ -248,6 +248,16 @@ dotnet run --project samples/MeshArena.SkiaSharp.Uno/MeshArena.SkiaSharp.Uno/Mes
 
 This sample researches and applies native Skia `SkMesh` usage patterns in an original luminous forest platformer named Luma Grove. It uses three mesh passes: an indexed parallax forest grid, a non-indexed `SKMeshMode.TriangleStrip` spirit aura trail, and an indexed sprite/entity batch for platforms, foliage, the spirit player, light seed collectibles, shadow wisps, thorn hazards, and particles. A/D or arrows move, Space/W/Up jumps, Shift/Enter or mouse click dashes, S/Down slows on ledges, and R respawns. The sample uses original procedural mesh/shader artwork and no fallback renderer.
 
+### Mesh Modeler SkiaSharp Uno Sample
+
+Run the 3D modeling Uno Platform mesh sample after installing the same SkiaSharp PR 3779 package artifacts:
+
+```bash
+dotnet run --project samples/MeshModeler.SkiaSharp.Uno/MeshModeler.SkiaSharp.Uno/MeshModeler.SkiaSharp.Uno.csproj
+```
+
+This sample uses `SKMesh` as the rasterization layer for projected 3D data. It supports built-in torus/cube models, OBJ loading, orbit/pan/zoom controls, vertex selection and camera-plane editing, UV checker texture shading, depth visualization, normal visualization, barycentric wire overlay, and CPU triangle depth sorting before `SKMesh.MakeIndexed`.
+
 ## Validation
 
 ### Binding Benchmarks
