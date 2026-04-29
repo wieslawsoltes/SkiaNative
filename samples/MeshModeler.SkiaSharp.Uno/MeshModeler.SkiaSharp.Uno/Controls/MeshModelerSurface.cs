@@ -1,10 +1,15 @@
 using System;
+using System.Buffers;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.IO.Compression;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
@@ -43,6 +48,8 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
     private const float NearPlane = 0.08f;
     private const int DepthSortedMaterialTriangleLimit = 350_000;
     private const int MaxSplatsPerBatch = MaxSubmittedIndices / 6;
+    private const int SplatReadBufferBytes = 4 * 1024 * 1024;
+    private const float MinProjectedSplatExtent = 0.35f;
     private const float SphericalHarmonicsC0 = 0.28209479177387814f;
 
     private const string VertexShader = @"
@@ -291,8 +298,10 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
     private readonly List<SplatDrawItem> _splatDrawItems = new(16384);
     private readonly List<MeshBatch> _meshBatches = new(16);
     private readonly List<MeshBatch> _projectedMeshBatches = new(16);
+    private readonly List<SplatMeshBatch> _splatBatches = new(32);
     private bool _meshBatchesDirty = true;
     private bool _projectedMeshBatchesDirty = true;
+    private bool _splatBatchesDirty = true;
     private readonly SKPaint _meshPaint = new() { IsAntialias = true, BlendMode = SKBlendMode.SrcOver, Color = SKColors.White };
     private readonly SKPaint _gridPaint = new() { IsAntialias = true, StrokeWidth = 1, Color = new SKColor(62, 91, 118, 120) };
     private readonly SKPaint _axisXPaint = new() { IsAntialias = true, StrokeWidth = 2, Color = new SKColor(240, 80, 80, 190) };
@@ -321,6 +330,7 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
     private int _submittedVertexCount;
     private int _submittedIndexCount;
     private int _projectedVisibleTriangleCount;
+    private int _splatVisibleCount;
     private float _projectedCacheWidth;
     private float _projectedCacheHeight;
     private float _projectedCacheYaw;
@@ -331,6 +341,14 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
     private float _projectedCacheTargetZ;
     private int _projectedCacheModeBucket;
     private bool _projectedCacheUsesPerMaterialUniforms;
+    private float _splatCacheWidth;
+    private float _splatCacheHeight;
+    private float _splatCacheYaw;
+    private float _splatCachePitch;
+    private float _splatCacheDistance;
+    private float _splatCacheTargetX;
+    private float _splatCacheTargetY;
+    private float _splatCacheTargetZ;
     private int _drawCalls;
     private int _selectedVertex = -1;
     private bool _editMode;
@@ -407,7 +425,7 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
     public void LoadGaussianSplatFile(string path)
     {
         var name = System.IO.Path.GetFileName(path);
-        ReplaceSplatCloud(GaussianSplatCloud.LoadPly(path, name));
+        ReplaceSplatCloud(GaussianSplatCloud.Load(path, name));
         ResetView();
         _status = BuildSplatLoadStatus(name);
         Invalidate();
@@ -483,11 +501,14 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
     {
         if (_splatCloud is null)
         {
-            return $"Loaded Gaussian splat PLY '{name}'.";
+            return $"Loaded Gaussian splat file '{name}'.";
         }
 
-        var format = _splatCloud.SourceFormat.Length == 0 ? "PLY" : _splatCloud.SourceFormat;
-        return $"Loaded Gaussian splat PLY '{name}' with {_splatCloud.Splats.Length:N0} splats from {format}; rendering as sorted anisotropic SKMesh quads.";
+        var format = _splatCloud.SourceFormat.Length == 0 ? "Gaussian splat" : _splatCloud.SourceFormat;
+        var loadedText = _splatCloud.SourceSplatCount == _splatCloud.Splats.Length
+            ? $"{_splatCloud.Splats.Length:N0}"
+            : $"{_splatCloud.Splats.Length:N0}/{_splatCloud.SourceSplatCount:N0}";
+        return $"Loaded Gaussian splat file '{name}' with {loadedText} splats from {format}; rendering cached anisotropic SKMesh quad batches.";
     }
 
     protected override void RenderOverride(SKCanvas canvas, Size area)
@@ -522,6 +543,7 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
         _splatSpecification = null;
         DisposeMeshBatches();
         DisposeProjectedMeshBatches();
+        DisposeSplatBatches();
         _document.Dispose();
     }
 
@@ -594,6 +616,11 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
         _draggingVertex = false;
         _pointerAction = PointerAction.None;
         ReleasePointerCapture(e.Pointer);
+        if (_splatCloud is not null)
+        {
+            _splatBatchesDirty = true;
+            Invalidate();
+        }
     }
 
     private void OnPointerWheelChanged(object sender, PointerRoutedEventArgs e)
@@ -667,9 +694,11 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
         _splatCloud = null;
         _meshBatchesDirty = true;
         _projectedMeshBatchesDirty = true;
+        _splatBatchesDirty = true;
         _selectedVertex = -1;
         DisposeMeshBatches();
         DisposeProjectedMeshBatches();
+        DisposeSplatBatches();
         old.Dispose();
     }
 
@@ -678,10 +707,12 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
         _splatCloud = cloud;
         _meshBatchesDirty = true;
         _projectedMeshBatchesDirty = true;
+        _splatBatchesDirty = true;
         _selectedVertex = -1;
         _editMode = false;
         DisposeMeshBatches();
         DisposeProjectedMeshBatches();
+        DisposeSplatBatches();
     }
 
     private void DrawScene(SKCanvas canvas, float width, float height)
@@ -910,7 +941,6 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
         _drawCalls = 0;
         _submittedVertexCount = 0;
         _submittedIndexCount = 0;
-        _splatDrawItems.Clear();
 
         var cloud = _splatCloud;
         if (cloud is null || _splatSpecification is null)
@@ -918,18 +948,57 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
             return;
         }
 
-        foreach (var splat in cloud.Splats)
+        if (!EnsureSplatBatches(width, height))
         {
-            if (TryProjectSplat(splat, width, height, out var item))
+            return;
+        }
+
+        foreach (var batch in _splatBatches)
+        {
+            canvas.DrawMesh(batch.Mesh, _meshPaint);
+            _drawCalls++;
+            _submittedVertexCount += batch.VertexCount;
+            _submittedIndexCount += batch.IndexCount;
+        }
+
+        var sourceText = cloud.SourceSplatCount == cloud.Splats.Length
+            ? $"{cloud.Splats.Length:N0}"
+            : $"{cloud.Splats.Length:N0}/{cloud.SourceSplatCount:N0} loaded";
+        _status = $"Rendered {sourceText} Gaussian splats (all {_splatVisibleCount:N0} visible splats, cached) through {_drawCalls:N0} SKMesh quad batch{(_drawCalls == 1 ? string.Empty : "es")}.";
+    }
+
+    private bool EnsureSplatBatches(float width, float height)
+    {
+        if (SplatBatchCacheMatches(width, height))
+        {
+            return _splatBatches.Count > 0;
+        }
+
+        DisposeSplatBatches();
+        _splatDrawItems.Clear();
+        _splatVisibleCount = 0;
+
+        var cloud = _splatCloud;
+        if (cloud is null || _splatSpecification is null)
+        {
+            return false;
+        }
+
+        for (var i = 0; i < cloud.Splats.Length; i++)
+        {
+            if (TryProjectSplat(cloud.Splats[i], width, height, out var item))
             {
                 _splatDrawItems.Add(item);
             }
         }
 
+        _splatVisibleCount = _splatDrawItems.Count;
         if (_splatDrawItems.Count == 0)
         {
             _status = "No visible Gaussian splats after camera near-plane and viewport culling.";
-            return;
+            _splatBatchesDirty = false;
+            StoreSplatBatchCacheKey(width, height);
+            return false;
         }
 
         _splatDrawItems.Sort(static (a, b) => b.Depth.CompareTo(a.Depth));
@@ -941,9 +1010,10 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
             if (batchVertexCount > 0 &&
                 (batchVertexCount + 4 > MaxSubmittedVertices || batchIndexCount + 6 > MaxSubmittedIndices))
             {
-                if (!DrawSplatBatch(canvas, width, height, batchVertexCount, batchIndexCount))
+                if (!AddSplatBatch(width, height, batchVertexCount, batchIndexCount))
                 {
-                    return;
+                    _splatDrawItems.Clear();
+                    return false;
                 }
 
                 batchVertexCount = 0;
@@ -953,18 +1023,47 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
             AppendSplatToBatch(item, ref batchVertexCount, ref batchIndexCount);
         }
 
-        if (batchVertexCount > 0)
+        if (batchVertexCount > 0 && !AddSplatBatch(width, height, batchVertexCount, batchIndexCount))
         {
-            if (!DrawSplatBatch(canvas, width, height, batchVertexCount, batchIndexCount))
-            {
-                return;
-            }
+            _splatDrawItems.Clear();
+            return false;
         }
 
-        var renderedText = _splatDrawItems.Count == cloud.Splats.Length
-            ? $"{cloud.Splats.Length:N0}"
-            : $"{_splatDrawItems.Count:N0}/{cloud.Splats.Length:N0} visible";
-        _status = $"Rendered {renderedText} Gaussian splats through {_drawCalls:N0} depth-sorted SKMesh quad batch{(_drawCalls == 1 ? string.Empty : "es")}.";
+        _splatDrawItems.Clear();
+        if (_splatDrawItems.Capacity > 262_144)
+        {
+            _splatDrawItems.TrimExcess();
+        }
+
+        _splatBatchesDirty = false;
+        StoreSplatBatchCacheKey(width, height);
+        return _splatBatches.Count > 0;
+    }
+
+    private bool SplatBatchCacheMatches(float width, float height)
+    {
+        const float epsilon = 0.0001f;
+        return !_splatBatchesDirty &&
+               MathF.Abs(_splatCacheWidth - width) < 0.5f &&
+               MathF.Abs(_splatCacheHeight - height) < 0.5f &&
+               MathF.Abs(_splatCacheYaw - _yaw) < epsilon &&
+               MathF.Abs(_splatCachePitch - _pitch) < epsilon &&
+               MathF.Abs(_splatCacheDistance - _distance) < epsilon &&
+               MathF.Abs(_splatCacheTargetX - _target.X) < epsilon &&
+               MathF.Abs(_splatCacheTargetY - _target.Y) < epsilon &&
+               MathF.Abs(_splatCacheTargetZ - _target.Z) < epsilon;
+    }
+
+    private void StoreSplatBatchCacheKey(float width, float height)
+    {
+        _splatCacheWidth = width;
+        _splatCacheHeight = height;
+        _splatCacheYaw = _yaw;
+        _splatCachePitch = _pitch;
+        _splatCacheDistance = _distance;
+        _splatCacheTargetX = _target.X;
+        _splatCacheTargetY = _target.Y;
+        _splatCacheTargetZ = _target.Z;
     }
 
     private bool TryProjectSplat(GaussianSplat splat, float width, float height, out SplatDrawItem item)
@@ -991,7 +1090,7 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
 
         ComputeEllipseAxes(c00, c01, c11, MathF.Min(width, height) * 0.22f, out var ax, out var ay, out var bx, out var by);
         var maxExtent = MathF.Max(MathF.Sqrt(ax * ax + ay * ay), MathF.Sqrt(bx * bx + by * by));
-        if (maxExtent < 0.25f)
+        if (maxExtent < MinProjectedSplatExtent)
         {
             return false;
         }
@@ -1086,7 +1185,7 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
             item.Alpha,
             item.Depth);
 
-    private bool DrawSplatBatch(SKCanvas canvas, float width, float height, int vertexCount, int indexCount)
+    private bool AddSplatBatch(float width, float height, int vertexCount, int indexCount)
     {
         if (_splatSpecification is null)
         {
@@ -1095,10 +1194,10 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
         }
 
         FillUniforms(width, height, _document.GetMaterial(0));
-        using var uniforms = SKData.CreateCopy(MemoryMarshal.AsBytes(_uniformData.AsSpan()));
-        using var vertices = SKMeshVertexBuffer.Make(MemoryMarshal.AsBytes(_splatVertices.AsSpan(0, vertexCount)));
-        using var indices = SKMeshIndexBuffer.Make(MemoryMarshal.AsBytes(_submittedIndices.AsSpan(0, indexCount)));
-        using var mesh = SKMesh.MakeIndexed(
+        var uniforms = SKData.CreateCopy(MemoryMarshal.AsBytes(_uniformData.AsSpan()));
+        var vertices = SKMeshVertexBuffer.Make(MemoryMarshal.AsBytes(_splatVertices.AsSpan(0, vertexCount)));
+        var indices = SKMeshIndexBuffer.Make(MemoryMarshal.AsBytes(_submittedIndices.AsSpan(0, indexCount)));
+        var mesh = SKMesh.MakeIndexed(
             _splatSpecification,
             SKMeshMode.Triangles,
             vertices,
@@ -1114,13 +1213,14 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
         if (mesh is null || !mesh.IsValid)
         {
             _status = string.IsNullOrWhiteSpace(errors) ? "Gaussian splat SKMesh.MakeIndexed failed." : errors;
+            mesh?.Dispose();
+            vertices.Dispose();
+            indices.Dispose();
+            uniforms.Dispose();
             return false;
         }
 
-        canvas.DrawMesh(mesh, _meshPaint);
-        _drawCalls++;
-        _submittedVertexCount += vertexCount;
-        _submittedIndexCount += indexCount;
+        _splatBatches.Add(new SplatMeshBatch(vertexCount, indexCount, vertices, indices, uniforms, mesh));
         return true;
     }
 
@@ -1566,6 +1666,16 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
         _projectedMeshBatches.Clear();
     }
 
+    private void DisposeSplatBatches()
+    {
+        foreach (var batch in _splatBatches)
+        {
+            batch.Dispose();
+        }
+
+        _splatBatches.Clear();
+    }
+
     private void DrawReferenceGrid(SKCanvas canvas, float width, float height)
     {
         var extent = MathF.Max(2, MathF.Ceiling(ActiveRadius * 1.8f));
@@ -1956,6 +2066,34 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
         }
     }
 
+    private sealed class SplatMeshBatch : IDisposable
+    {
+        public SplatMeshBatch(int vertexCount, int indexCount, SKMeshVertexBuffer vertexBuffer, SKMeshIndexBuffer indexBuffer, SKData uniforms, SKMesh mesh)
+        {
+            VertexCount = vertexCount;
+            IndexCount = indexCount;
+            VertexBuffer = vertexBuffer;
+            IndexBuffer = indexBuffer;
+            Uniforms = uniforms;
+            Mesh = mesh;
+        }
+
+        public int VertexCount { get; }
+        public int IndexCount { get; }
+        public SKMeshVertexBuffer VertexBuffer { get; }
+        public SKMeshIndexBuffer IndexBuffer { get; }
+        public SKData Uniforms { get; }
+        public SKMesh Mesh { get; }
+
+        public void Dispose()
+        {
+            Mesh.Dispose();
+            Uniforms.Dispose();
+            VertexBuffer.Dispose();
+            IndexBuffer.Dispose();
+        }
+    }
+
     private sealed class MeshMaterial : IDisposable
     {
         private SKImage? _diffuseImage;
@@ -2061,17 +2199,25 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
 
     private sealed class GaussianSplatCloud
     {
-        private GaussianSplatCloud(string name, GaussianSplat[] splats, string sourceFormat)
+        private static readonly JsonSerializerOptions SogJsonOptions = new()
+        {
+            PropertyNameCaseInsensitive = true
+        };
+
+        private GaussianSplatCloud(string name, GaussianSplat[] splats, string sourceFormat, int sourceSplatCount)
         {
             Name = name;
             SourceFormat = sourceFormat;
-            Splats = NormalizeSplats(splats, out var radius);
+            SourceSplatCount = sourceSplatCount;
+            NormalizeSplats(splats, out var radius);
+            Splats = splats;
             Center = new Vec3(0, 0, 0);
             Radius = radius;
         }
 
         public string Name { get; }
         public string SourceFormat { get; }
+        public int SourceSplatCount { get; }
         public GaussianSplat[] Splats { get; }
         public Vec3 Center { get; }
         public float Radius { get; }
@@ -2101,7 +2247,30 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
                 splats[i] = new GaussianSplat(position, axis0, axis1, axis2, color.X, color.Y, color.Z, alpha);
             }
 
-            return new GaussianSplatCloud("Procedural Gaussian splat spiral", splats, "procedural");
+            return new GaussianSplatCloud("Procedural Gaussian splat spiral", splats, "procedural", splats.Length);
+        }
+
+        public static GaussianSplatCloud Load(string path, string name)
+        {
+            if (Directory.Exists(path))
+            {
+                return LoadSog(path, name);
+            }
+
+            var extension = System.IO.Path.GetExtension(path);
+            if (extension.Equals(".ply", StringComparison.OrdinalIgnoreCase))
+            {
+                return LoadPly(path, name);
+            }
+
+            if (extension.Equals(".sog", StringComparison.OrdinalIgnoreCase) ||
+                extension.Equals(".json", StringComparison.OrdinalIgnoreCase) ||
+                System.IO.Path.GetFileName(path).Equals("meta.json", StringComparison.OrdinalIgnoreCase))
+            {
+                return LoadSog(path, name);
+            }
+
+            throw new NotSupportedException($"Gaussian splat file '{path}' is not supported. Supported formats: PLY, SOG zip, SOG directory, and SOG meta.json.");
         }
 
         public static GaussianSplatCloud LoadPly(string path, string name)
@@ -2120,20 +2289,336 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
                 _ => throw new NotSupportedException($"PLY format '{header.Format}' is not supported. Supported formats: ascii, binary_little_endian.")
             };
 
-            if (splats.Count == 0)
+            if (splats.Length == 0)
             {
                 throw new InvalidOperationException("PLY did not contain any readable Gaussian splats.");
             }
 
-            return new GaussianSplatCloud(name, splats.ToArray(), header.Format);
+            return new GaussianSplatCloud(name, splats, header.Format, header.VertexCount);
         }
 
-        private static GaussianSplat[] NormalizeSplats(GaussianSplat[] splats, out float radius)
+        public static GaussianSplatCloud LoadSog(string path, string name)
+        {
+            if (Directory.Exists(path))
+            {
+                var root = System.IO.Path.GetFullPath(path);
+                var metaPath = System.IO.Path.Combine(root, "meta.json");
+                if (!File.Exists(metaPath))
+                {
+                    throw new FileNotFoundException("SOG directory does not contain meta.json.", metaPath);
+                }
+
+                return LoadSogFromBytes(
+                    File.ReadAllBytes(metaPath),
+                    relativePath => File.ReadAllBytes(System.IO.Path.Combine(root, NormalizeSogPath(relativePath))),
+                    name,
+                    "PlayCanvas SOG directory");
+            }
+
+            var extension = System.IO.Path.GetExtension(path);
+            if (extension.Equals(".sog", StringComparison.OrdinalIgnoreCase))
+            {
+                using var archive = ZipFile.OpenRead(path);
+                var metaBytes = ReadSogArchiveFile(archive, "meta.json");
+                return LoadSogFromBytes(
+                    metaBytes,
+                    relativePath => ReadSogArchiveFile(archive, relativePath),
+                    name,
+                    "PlayCanvas SOG zip");
+            }
+
+            var directory = System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(path)) ?? Directory.GetCurrentDirectory();
+            return LoadSogFromBytes(
+                File.ReadAllBytes(path),
+                relativePath => File.ReadAllBytes(System.IO.Path.Combine(directory, NormalizeSogPath(relativePath))),
+                name,
+                "PlayCanvas SOG directory");
+        }
+
+        private static GaussianSplatCloud LoadSogFromBytes(byte[] metaBytes, Func<string, byte[]> readFile, string name, string sourceFormat)
+        {
+            var meta = JsonSerializer.Deserialize<SogMeta>(metaBytes, SogJsonOptions)
+                ?? throw new InvalidDataException("SOG meta.json is empty or invalid.");
+            ValidateSogMeta(meta);
+
+            using var meansLow = DecodeSogImage(readFile(meta.Means!.Files![0]), meta.Means.Files[0]);
+            using var meansHigh = DecodeSogImage(readFile(meta.Means.Files[1]), meta.Means.Files[1]);
+            using var scales = DecodeSogImage(readFile(meta.Scales!.Files![0]), meta.Scales.Files[0]);
+            using var quats = DecodeSogImage(readFile(meta.Quats!.Files![0]), meta.Quats.Files[0]);
+            using var sh0 = DecodeSogImage(readFile(meta.Sh0!.Files![0]), meta.Sh0.Files[0]);
+
+            var imageCapacity = MinPixelCount(meansLow, meansHigh, scales, quats, sh0);
+            var sourceCount = Math.Min(meta.Count, imageCapacity);
+            if (sourceCount <= 0)
+            {
+                throw new InvalidDataException("SOG does not contain any addressable Gaussian splats.");
+            }
+
+            var maxLoadedSplats = GetMaxLoadedSplats(sourceCount);
+            var sampleStep = Math.Max(1, (sourceCount + maxLoadedSplats - 1) / maxLoadedSplats);
+            var splats = new List<GaussianSplat>(Math.Min(sourceCount, maxLoadedSplats));
+            var scalesAreLogEncoded = IsSogLogScaleCodebook(meta.Scales.Codebook!);
+            for (var i = 0; i < sourceCount; i++)
+            {
+                if (sampleStep > 1 && i % sampleStep != 0)
+                {
+                    continue;
+                }
+
+                if (TryCreateSogSplat(meta, meansLow, meansHigh, scales, quats, sh0, scalesAreLogEncoded, i, out var splat))
+                {
+                    splats.Add(splat);
+                }
+            }
+
+            if (splats.Count == 0)
+            {
+                throw new InvalidDataException("SOG did not contain any readable Gaussian splats.");
+            }
+
+            return new GaussianSplatCloud(name, splats.ToArray(), sourceFormat, meta.Count);
+        }
+
+        private static bool TryCreateSogSplat(
+            SogMeta meta,
+            SogImage meansLow,
+            SogImage meansHigh,
+            SogImage scales,
+            SogImage quats,
+            SogImage sh0,
+            bool scalesAreLogEncoded,
+            int index,
+            out GaussianSplat splat)
+        {
+            splat = default;
+            var x = DecodeSogUInt16(meansLow, meansHigh, index, 0);
+            var y = DecodeSogUInt16(meansLow, meansHigh, index, 1);
+            var z = DecodeSogUInt16(meansLow, meansHigh, index, 2);
+            var position = new Vec3(
+                DecodeSogUnlogLerp(x, meta.Means!.Mins![0], meta.Means.Maxs![0]),
+                DecodeSogUnlogLerp(y, meta.Means.Mins[1], meta.Means.Maxs[1]),
+                DecodeSogUnlogLerp(z, meta.Means.Mins[2], meta.Means.Maxs[2]));
+
+            var scaleCodebook = meta.Scales!.Codebook!;
+            var scale = new Vec3(
+                ReadSogScale(scaleCodebook, scales.Get(index, 0), scalesAreLogEncoded),
+                ReadSogScale(scaleCodebook, scales.Get(index, 1), scalesAreLogEncoded),
+                ReadSogScale(scaleCodebook, scales.Get(index, 2), scalesAreLogEncoded));
+
+            DecodeSogQuaternion(quats, index, out var qw, out var qx, out var qy, out var qz);
+            QuaternionToAxes(qw, qx, qy, qz, out var basis0, out var basis1, out var basis2);
+
+            var sh0Codebook = meta.Sh0!.Codebook!;
+            var color = new Vec3(
+                Math.Clamp(0.5f + SphericalHarmonicsC0 * ReadSogCodebook(sh0Codebook, sh0.Get(index, 0), "sh0"), 0.0f, 1.0f),
+                Math.Clamp(0.5f + SphericalHarmonicsC0 * ReadSogCodebook(sh0Codebook, sh0.Get(index, 1), "sh0"), 0.0f, 1.0f),
+                Math.Clamp(0.5f + SphericalHarmonicsC0 * ReadSogCodebook(sh0Codebook, sh0.Get(index, 2), "sh0"), 0.0f, 1.0f));
+            var alpha = sh0.Get(index, 3) / 255.0f;
+            if (alpha <= 0.003f)
+            {
+                return false;
+            }
+
+            splat = new GaussianSplat(
+                position,
+                basis0 * scale.X,
+                basis1 * scale.Y,
+                basis2 * scale.Z,
+                color.X,
+                color.Y,
+                color.Z,
+                alpha);
+            return true;
+        }
+
+        private static void ValidateSogMeta(SogMeta meta)
+        {
+            if (meta.Version != 2)
+            {
+                throw new NotSupportedException($"SOG version {meta.Version} is not supported. Supported version: 2.");
+            }
+
+            if (meta.Count <= 0)
+            {
+                throw new InvalidDataException("SOG count must be greater than zero.");
+            }
+
+            ValidateSogFiles(meta.Means, "means", expectedFileCount: 2);
+            ValidateSogFiles(meta.Scales, "scales", expectedFileCount: 1);
+            ValidateSogFiles(meta.Quats, "quats", expectedFileCount: 1);
+            ValidateSogFiles(meta.Sh0, "sh0", expectedFileCount: 1);
+
+            if (meta.Means!.Mins is null || meta.Means.Maxs is null || meta.Means.Mins.Length < 3 || meta.Means.Maxs.Length < 3)
+            {
+                throw new InvalidDataException("SOG means.mins and means.maxs must contain at least three values.");
+            }
+
+            if (meta.Scales!.Codebook is null || meta.Scales.Codebook.Length < 256 ||
+                meta.Sh0!.Codebook is null || meta.Sh0.Codebook.Length < 256)
+            {
+                throw new InvalidDataException("SOG scales.codebook and sh0.codebook must contain at least 256 values.");
+            }
+        }
+
+        private static void ValidateSogFiles(SogSection? section, string name, int expectedFileCount)
+        {
+            if (section?.Files is null || section.Files.Length < expectedFileCount)
+            {
+                throw new InvalidDataException($"SOG {name}.files must contain at least {expectedFileCount} file path{(expectedFileCount == 1 ? string.Empty : "s")}.");
+            }
+        }
+
+        private static SogImage DecodeSogImage(byte[] encoded, string name)
+        {
+            using var data = SKData.CreateCopy(encoded);
+            using var codec = SKCodec.Create(data)
+                ?? throw new InvalidDataException($"SOG image '{name}' could not be decoded by Skia.");
+            var info = new SKImageInfo(codec.Info.Width, codec.Info.Height, SKColorType.Rgba8888, SKAlphaType.Unpremul);
+            var bitmap = new SKBitmap(info);
+            var result = codec.GetPixels(info, bitmap.GetPixels());
+            if (result is not SKCodecResult.Success and not SKCodecResult.IncompleteInput)
+            {
+                bitmap.Dispose();
+                throw new InvalidDataException($"SOG image '{name}' decode failed with result {result}.");
+            }
+
+            return new SogImage(bitmap);
+        }
+
+        private static byte[] ReadSogArchiveFile(ZipArchive archive, string path)
+        {
+            var normalized = NormalizeSogPath(path);
+            var entry = archive.GetEntry(normalized) ?? FindSogArchiveEntry(archive, normalized);
+            if (entry is null)
+            {
+                throw new FileNotFoundException($"SOG zip does not contain '{path}'.");
+            }
+
+            using var stream = entry.Open();
+            using var memory = new MemoryStream((int)Math.Min(entry.Length, int.MaxValue));
+            stream.CopyTo(memory);
+            return memory.ToArray();
+        }
+
+        private static ZipArchiveEntry? FindSogArchiveEntry(ZipArchive archive, string normalizedPath)
+        {
+            var fileName = System.IO.Path.GetFileName(normalizedPath);
+            foreach (var entry in archive.Entries)
+            {
+                var entryName = NormalizeSogPath(entry.FullName);
+                if (entryName.Equals(normalizedPath, StringComparison.OrdinalIgnoreCase) ||
+                    entryName.EndsWith("/" + normalizedPath, StringComparison.OrdinalIgnoreCase) ||
+                    System.IO.Path.GetFileName(entryName).Equals(fileName, StringComparison.OrdinalIgnoreCase))
+                {
+                    return entry;
+                }
+            }
+
+            return null;
+        }
+
+        private static string NormalizeSogPath(string path) => path.Replace('\\', '/').TrimStart('/');
+
+        private static int MinPixelCount(params SogImage[] images)
+        {
+            var count = int.MaxValue;
+            foreach (var image in images)
+            {
+                count = Math.Min(count, image.PixelCount);
+            }
+
+            return count == int.MaxValue ? 0 : count;
+        }
+
+        private static int DecodeSogUInt16(SogImage low, SogImage high, int index, int channel)
+            => low.Get(index, channel) | (high.Get(index, channel) << 8);
+
+        private static float DecodeSogUnlogLerp(int quantized, float min, float max)
+        {
+            var encoded = min + (max - min) * (quantized / 65535.0f);
+            return encoded < 0.0f ? 1.0f - MathF.Exp(-encoded) : MathF.Exp(encoded) - 1.0f;
+        }
+
+        private static float ReadSogCodebook(float[] codebook, int index, string name)
+        {
+            if ((uint)index >= (uint)codebook.Length)
+            {
+                throw new InvalidDataException($"SOG {name}.codebook does not contain index {index}.");
+            }
+
+            return codebook[index];
+        }
+
+        private static bool IsSogLogScaleCodebook(float[] codebook)
+        {
+            foreach (var value in codebook)
+            {
+                if (value <= 0.0f)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static float ReadSogScale(float[] codebook, int index, bool isLogEncoded)
+        {
+            var value = ReadSogCodebook(codebook, index, "scales");
+            return isLogEncoded ? LogScaleToRadius(value) : MathF.Max(0.00001f, value);
+        }
+
+        private static void DecodeSogQuaternion(SogImage quats, int index, out float qw, out float qx, out float qy, out float qz)
+        {
+            var a = DecodeSogQuatComponent(quats.Get(index, 0));
+            var b = DecodeSogQuatComponent(quats.Get(index, 1));
+            var c = DecodeSogQuatComponent(quats.Get(index, 2));
+            var mode = quats.Get(index, 3);
+            var d = MathF.Sqrt(MathF.Max(0.0f, 1.0f - a * a - b * b - c * c));
+
+            // The alpha channel identifies the omitted component in [x, y, z, w].
+            switch (mode)
+            {
+                case 252:
+                    qx = d; qy = a; qz = b; qw = c;
+                    break;
+                case 253:
+                    qx = a; qy = d; qz = b; qw = c;
+                    break;
+                case 254:
+                    qx = a; qy = b; qz = d; qw = c;
+                    break;
+                case 255:
+                    qx = a; qy = b; qz = c; qw = d;
+                    break;
+                default:
+                    qx = qy = qz = 0.0f;
+                    qw = 1.0f;
+                    break;
+            }
+
+            var length = MathF.Sqrt(qw * qw + qx * qx + qy * qy + qz * qz);
+            if (length <= 0.00001f)
+            {
+                qw = 1.0f;
+                qx = qy = qz = 0.0f;
+                return;
+            }
+
+            qw /= length;
+            qx /= length;
+            qy /= length;
+            qz /= length;
+        }
+
+        private static float DecodeSogQuatComponent(int value) => (value / 255.0f - 0.5f) * (2.0f / MathF.Sqrt(2.0f));
+
+        private static void NormalizeSplats(GaussianSplat[] splats, out float radius)
         {
             if (splats.Length == 0)
             {
                 radius = 1.0f;
-                return splats;
+                return;
             }
 
             var min = splats[0].Position;
@@ -2151,13 +2636,12 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
             }
 
             var scale = radius <= 0.0001f ? 1.0f : 1.65f / radius;
-            var normalized = new GaussianSplat[splats.Length];
             radius = 0.001f;
             for (var i = 0; i < splats.Length; i++)
             {
                 var splat = splats[i];
                 var position = (splat.Position - center) * scale;
-                normalized[i] = splat with
+                splats[i] = splat with
                 {
                     Position = position,
                     Axis0 = splat.Axis0 * scale,
@@ -2166,8 +2650,6 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
                 };
                 radius = MathF.Max(radius, position.Length);
             }
-
-            return normalized;
         }
 
         private static void ExpandSplatBounds(Vec3 point, ref Vec3 min, ref Vec3 max)
@@ -2243,9 +2725,11 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
             return new PlyHeader(format, vertexCount, vertexProperties.ToArray());
         }
 
-        private static List<GaussianSplat> ReadAsciiSplats(Stream stream, PlyHeader header)
+        private static GaussianSplat[] ReadAsciiSplats(Stream stream, PlyHeader header)
         {
-            var splats = new List<GaussianSplat>(header.VertexCount);
+            var maxLoadedSplats = GetMaxLoadedSplats(header.VertexCount);
+            var sampleStep = Math.Max(1, (header.VertexCount + maxLoadedSplats - 1) / maxLoadedSplats);
+            var splats = new List<GaussianSplat>(Math.Min(header.VertexCount, maxLoadedSplats));
             using var reader = new StreamReader(stream, Encoding.ASCII, detectEncodingFromByteOrderMarks: false, bufferSize: 1 << 16, leaveOpen: true);
             var values = new double[header.Properties.Length];
             var layout = new PlyLayout(header.Properties);
@@ -2255,6 +2739,11 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
                 if (line is null)
                 {
                     break;
+                }
+
+                if (sampleStep > 1 && i % sampleStep != 0)
+                {
+                    continue;
                 }
 
                 var parts = SplitWhitespace(line);
@@ -2274,29 +2763,61 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
                 }
             }
 
-            return splats;
+            return splats.ToArray();
         }
 
-        private static List<GaussianSplat> ReadBinarySplats(Stream stream, PlyHeader header)
+        private static GaussianSplat[] ReadBinarySplats(Stream stream, PlyHeader header)
         {
-            var splats = new List<GaussianSplat>(header.VertexCount);
-            using var reader = new BinaryReader(stream, Encoding.ASCII, leaveOpen: true);
-            var values = new double[header.Properties.Length];
-            var layout = new PlyLayout(header.Properties);
-            for (var i = 0; i < header.VertexCount; i++)
+            var layout = new PlyBinaryLayout(header.Properties);
+            var maxLoadedSplats = GetMaxLoadedSplats(header.VertexCount);
+            var sampleStep = Math.Max(1, (header.VertexCount + maxLoadedSplats - 1) / maxLoadedSplats);
+            var splats = new List<GaussianSplat>(Math.Min(header.VertexCount, maxLoadedSplats));
+            var recordsPerBuffer = Math.Max(1, SplatReadBufferBytes / layout.RecordStride);
+            var buffer = ArrayPool<byte>.Shared.Rent(recordsPerBuffer * layout.RecordStride);
+            try
             {
-                for (var p = 0; p < header.Properties.Length; p++)
+                var remaining = header.VertexCount;
+                var recordIndex = 0;
+                while (remaining > 0)
                 {
-                    values[p] = ReadBinaryScalar(reader, header.Properties[p].Type);
-                }
+                    var recordsToRead = Math.Min(recordsPerBuffer, remaining);
+                    var bytesToRead = recordsToRead * layout.RecordStride;
+                    stream.ReadExactly(buffer.AsSpan(0, bytesToRead));
+                    var chunk = buffer.AsSpan(0, bytesToRead);
+                    for (var r = 0; r < recordsToRead; r++, recordIndex++)
+                    {
+                        if (sampleStep > 1 && recordIndex % sampleStep != 0)
+                        {
+                            continue;
+                        }
 
-                if (TryCreateSplat(layout, values, out var splat))
-                {
-                    splats.Add(splat);
+                        var row = chunk.Slice(r * layout.RecordStride, layout.RecordStride);
+                        if (TryCreateSplat(new PlyBinaryValues(layout, row), out var splat))
+                        {
+                            splats.Add(splat);
+                        }
+                    }
+
+                    remaining -= recordsToRead;
                 }
             }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
 
-            return splats;
+            return splats.ToArray();
+        }
+
+        private static int GetMaxLoadedSplats(int sourceCount)
+        {
+            var value = Environment.GetEnvironmentVariable("MESHMODELER_MAX_SPLATS");
+            if (int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed) && parsed > 0)
+            {
+                return Math.Clamp(parsed, 10_000, sourceCount);
+            }
+
+            return sourceCount;
         }
 
         private static bool TryCreateSplat(PlyLayout layout, double[] values, out GaussianSplat splat)
@@ -2332,6 +2853,39 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
             return true;
         }
 
+        private static bool TryCreateSplat(PlyBinaryValues values, out GaussianSplat splat)
+        {
+            splat = default;
+            if (!values.TryGet("x", out var x) ||
+                !values.TryGet("y", out var y) ||
+                !values.TryGet("z", out var z))
+            {
+                return false;
+            }
+
+            var position = new Vec3((float)x, (float)y, (float)z);
+            var color = ReadSplatColor(values);
+            var alpha = ReadSplatAlpha(values);
+            if (alpha <= 0.003f)
+            {
+                return false;
+            }
+
+            var scale = ReadSplatScale(values);
+            ReadSplatRotation(values, out var qw, out var qx, out var qy, out var qz);
+            QuaternionToAxes(qw, qx, qy, qz, out var basis0, out var basis1, out var basis2);
+            splat = new GaussianSplat(
+                position,
+                basis0 * scale.X,
+                basis1 * scale.Y,
+                basis2 * scale.Z,
+                color.X,
+                color.Y,
+                color.Z,
+                alpha);
+            return true;
+        }
+
         private static Vec3 ReadSplatColor(PlyLayout layout, double[] values)
         {
             if (layout.TryGet(values, "f_dc_0", out var dc0) &&
@@ -2350,6 +2904,24 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
             return new Vec3(r, g, b);
         }
 
+        private static Vec3 ReadSplatColor(PlyBinaryValues values)
+        {
+            if (values.TryGet("f_dc_0", out var dc0) &&
+                values.TryGet("f_dc_1", out var dc1) &&
+                values.TryGet("f_dc_2", out var dc2))
+            {
+                return new Vec3(
+                    Math.Clamp(0.5f + SphericalHarmonicsC0 * (float)dc0, 0.0f, 1.0f),
+                    Math.Clamp(0.5f + SphericalHarmonicsC0 * (float)dc1, 0.0f, 1.0f),
+                    Math.Clamp(0.5f + SphericalHarmonicsC0 * (float)dc2, 0.0f, 1.0f));
+            }
+
+            var r = ReadColorChannel(values, "red", "r", fallback: 0.85f);
+            var g = ReadColorChannel(values, "green", "g", fallback: 0.90f);
+            var b = ReadColorChannel(values, "blue", "b", fallback: 1.0f);
+            return new Vec3(r, g, b);
+        }
+
         private static float ReadSplatAlpha(PlyLayout layout, double[] values)
         {
             if (layout.TryGet(values, "opacity", out var opacity))
@@ -2358,6 +2930,21 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
             }
 
             if (layout.TryGet(values, "alpha", out var alpha))
+            {
+                return NormalizeColorChannel((float)alpha);
+            }
+
+            return 0.45f;
+        }
+
+        private static float ReadSplatAlpha(PlyBinaryValues values)
+        {
+            if (values.TryGet("opacity", out var opacity))
+            {
+                return Sigmoid((float)opacity);
+            }
+
+            if (values.TryGet("alpha", out var alpha))
             {
                 return NormalizeColorChannel((float)alpha);
             }
@@ -2377,6 +2964,21 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
             var sx = ReadDirectScale(layout, values, "scale_x", "sx", 0.025f);
             var sy = ReadDirectScale(layout, values, "scale_y", "sy", sx);
             var sz = ReadDirectScale(layout, values, "scale_z", "sz", sy);
+            return new Vec3(sx, sy, sz);
+        }
+
+        private static Vec3 ReadSplatScale(PlyBinaryValues values)
+        {
+            if (values.TryGet("scale_0", out var s0) &&
+                values.TryGet("scale_1", out var s1) &&
+                values.TryGet("scale_2", out var s2))
+            {
+                return new Vec3(LogScaleToRadius((float)s0), LogScaleToRadius((float)s1), LogScaleToRadius((float)s2));
+            }
+
+            var sx = ReadDirectScale(values, "scale_x", "sx", 0.025f);
+            var sy = ReadDirectScale(values, "scale_y", "sy", sx);
+            var sz = ReadDirectScale(values, "scale_z", "sz", sy);
             return new Vec3(sx, sy, sz);
         }
 
@@ -2402,6 +3004,48 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
                 layout.TryGet(values, "qx", out var qxv);
                 layout.TryGet(values, "qy", out var qyv);
                 layout.TryGet(values, "qz", out var qzv);
+                qw = qwv == 0 ? 1.0f : (float)qwv;
+                qx = (float)qxv;
+                qy = (float)qyv;
+                qz = (float)qzv;
+            }
+
+            var length = MathF.Sqrt(qw * qw + qx * qx + qy * qy + qz * qz);
+            if (length <= 0.00001f)
+            {
+                qw = 1.0f;
+                qx = qy = qz = 0.0f;
+                return;
+            }
+
+            qw /= length;
+            qx /= length;
+            qy /= length;
+            qz /= length;
+        }
+
+        private static void ReadSplatRotation(PlyBinaryValues values, out float qw, out float qx, out float qy, out float qz)
+        {
+            qw = 1.0f;
+            qx = 0.0f;
+            qy = 0.0f;
+            qz = 0.0f;
+            if (values.TryGet("rot_0", out var r0) &&
+                values.TryGet("rot_1", out var r1) &&
+                values.TryGet("rot_2", out var r2) &&
+                values.TryGet("rot_3", out var r3))
+            {
+                qw = (float)r0;
+                qx = (float)r1;
+                qy = (float)r2;
+                qz = (float)r3;
+            }
+            else
+            {
+                values.TryGet("qw", out var qwv);
+                values.TryGet("qx", out var qxv);
+                values.TryGet("qy", out var qyv);
+                values.TryGet("qz", out var qzv);
                 qw = qwv == 0 ? 1.0f : (float)qwv;
                 qx = (float)qxv;
                 qy = (float)qyv;
@@ -2451,9 +3095,41 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
             _ => throw new NotSupportedException($"PLY scalar type '{type}' is not supported.")
         };
 
+        private static double ReadBinaryScalar(ReadOnlySpan<byte> row, int offset, string type) => type switch
+        {
+            "char" or "int8" => (sbyte)row[offset],
+            "uchar" or "uint8" => row[offset],
+            "short" or "int16" => BinaryPrimitives.ReadInt16LittleEndian(row.Slice(offset, sizeof(short))),
+            "ushort" or "uint16" => BinaryPrimitives.ReadUInt16LittleEndian(row.Slice(offset, sizeof(ushort))),
+            "int" or "int32" => BinaryPrimitives.ReadInt32LittleEndian(row.Slice(offset, sizeof(int))),
+            "uint" or "uint32" => BinaryPrimitives.ReadUInt32LittleEndian(row.Slice(offset, sizeof(uint))),
+            "float" or "float32" => BinaryPrimitives.ReadSingleLittleEndian(row.Slice(offset, sizeof(float))),
+            "double" or "float64" => BinaryPrimitives.ReadDoubleLittleEndian(row.Slice(offset, sizeof(double))),
+            _ => throw new NotSupportedException($"PLY scalar type '{type}' is not supported.")
+        };
+
+        private static int BinaryScalarSize(string type) => type switch
+        {
+            "char" or "int8" or "uchar" or "uint8" => 1,
+            "short" or "int16" or "ushort" or "uint16" => 2,
+            "int" or "int32" or "uint" or "uint32" or "float" or "float32" => 4,
+            "double" or "float64" => 8,
+            _ => throw new NotSupportedException($"PLY scalar type '{type}' is not supported.")
+        };
+
         private static float ReadColorChannel(PlyLayout layout, double[] values, string name, string shortName, float fallback)
         {
             if (layout.TryGet(values, name, out var value) || layout.TryGet(values, shortName, out value))
+            {
+                return NormalizeColorChannel((float)value);
+            }
+
+            return fallback;
+        }
+
+        private static float ReadColorChannel(PlyBinaryValues values, string name, string shortName, float fallback)
+        {
+            if (values.TryGet(name, out var value) || values.TryGet(shortName, out value))
             {
                 return NormalizeColorChannel((float)value);
             }
@@ -2465,6 +3141,11 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
         private static float LogScaleToRadius(float value) => MathF.Exp(Math.Clamp(value, -12.0f, 4.0f));
         private static float ReadDirectScale(PlyLayout layout, double[] values, string name, string shortName, float fallback)
             => layout.TryGet(values, name, out var value) || layout.TryGet(values, shortName, out value)
+                ? MathF.Max(0.00001f, (float)value)
+                : fallback;
+
+        private static float ReadDirectScale(PlyBinaryValues values, string name, string shortName, float fallback)
+            => values.TryGet(name, out var value) || values.TryGet(shortName, out value)
                 ? MathF.Max(0.00001f, (float)value)
                 : fallback;
 
@@ -2505,6 +3186,115 @@ public sealed partial class MeshModelerSurface : SKCanvasElement
 
         private readonly record struct PlyHeader(string Format, int VertexCount, PlyProperty[] Properties);
         private readonly record struct PlyProperty(string Name, string Type);
+        private readonly record struct PlyBinaryProperty(int Offset, string Type);
+
+        private sealed unsafe class SogImage : IDisposable
+        {
+            private readonly SKBitmap _bitmap;
+            private readonly byte* _pixels;
+
+            public SogImage(SKBitmap bitmap)
+            {
+                _bitmap = bitmap;
+                Width = bitmap.Width;
+                Height = bitmap.Height;
+                _pixels = (byte*)bitmap.GetPixels().ToPointer();
+            }
+
+            public int Width { get; }
+            public int Height { get; }
+            public int PixelCount => Width * Height;
+            public int Get(int index, int channel) => _pixels[index * 4 + channel];
+
+            public void Dispose() => _bitmap.Dispose();
+        }
+
+        private sealed class SogMeta
+        {
+            [JsonPropertyName("version")]
+            public int Version { get; set; }
+
+            [JsonPropertyName("count")]
+            public int Count { get; set; }
+
+            [JsonPropertyName("means")]
+            public SogSection? Means { get; set; }
+
+            [JsonPropertyName("scales")]
+            public SogSection? Scales { get; set; }
+
+            [JsonPropertyName("quats")]
+            public SogSection? Quats { get; set; }
+
+            [JsonPropertyName("sh0")]
+            public SogSection? Sh0 { get; set; }
+
+            [JsonPropertyName("shN")]
+            public SogSection? ShN { get; set; }
+        }
+
+        private sealed class SogSection
+        {
+            [JsonPropertyName("files")]
+            public string[]? Files { get; set; }
+
+            [JsonPropertyName("mins")]
+            public float[]? Mins { get; set; }
+
+            [JsonPropertyName("maxs")]
+            public float[]? Maxs { get; set; }
+
+            [JsonPropertyName("codebook")]
+            public float[]? Codebook { get; set; }
+        }
+
+        private readonly ref struct PlyBinaryValues
+        {
+            private readonly PlyBinaryLayout _layout;
+            private readonly ReadOnlySpan<byte> _row;
+
+            public PlyBinaryValues(PlyBinaryLayout layout, ReadOnlySpan<byte> row)
+            {
+                _layout = layout;
+                _row = row;
+            }
+
+            public bool TryGet(string name, out double value) => _layout.TryGet(_row, name, out value);
+        }
+
+        private sealed class PlyBinaryLayout
+        {
+            private readonly Dictionary<string, PlyBinaryProperty> _properties;
+
+            public PlyBinaryLayout(PlyProperty[] properties)
+            {
+                _properties = new Dictionary<string, PlyBinaryProperty>(properties.Length, StringComparer.OrdinalIgnoreCase);
+                var offset = 0;
+                foreach (var property in properties)
+                {
+                    _properties[property.Name] = new PlyBinaryProperty(offset, property.Type);
+                    offset += BinaryScalarSize(property.Type);
+                }
+
+                RecordStride = offset;
+            }
+
+            public int RecordStride { get; }
+
+            public bool TryGet(ReadOnlySpan<byte> row, string name, out double value)
+            {
+                if (_properties.TryGetValue(name, out var property) &&
+                    property.Offset >= 0 &&
+                    property.Offset + BinaryScalarSize(property.Type) <= row.Length)
+                {
+                    value = ReadBinaryScalar(row, property.Offset, property.Type);
+                    return true;
+                }
+
+                value = 0;
+                return false;
+            }
+        }
 
         private sealed class PlyLayout
         {

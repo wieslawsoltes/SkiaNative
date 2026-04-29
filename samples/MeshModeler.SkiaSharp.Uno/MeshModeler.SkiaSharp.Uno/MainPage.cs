@@ -104,7 +104,7 @@ public sealed partial class MainPage : Page
                 },
                 new TextBlock
                 {
-                    Text = "OBJ loading, Gaussian splat PLY loading, orbit/pan/zoom controls, vertex editing, UV texture coordinates, depth sorting, and shader-driven visualization.",
+                    Text = "OBJ loading, Gaussian splat PLY/SOG loading, orbit/pan/zoom controls, vertex editing, UV texture coordinates, depth sorting, and shader-driven visualization.",
                     FontSize = 14,
                     Foreground = Solid(0xFFB2C2D8)
                 }
@@ -131,7 +131,7 @@ public sealed partial class MainPage : Page
                     SectionTitle("Model"),
                     ButtonRow(
                         Button("Load OBJ", OnLoadObjClicked),
-                        Button("Load PLY", OnLoadPlyClicked),
+                        Button("Load Splats", OnLoadPlyClicked),
                         Button("Splats", (_, _) => _surface.LoadSampleSplats())),
                     ButtonRow(
                         Button("Torus", (_, _) => _surface.LoadSampleTorus()),
@@ -166,7 +166,7 @@ public sealed partial class MainPage : Page
                     Divider(),
                     new TextBlock
                     {
-                        Text = "Mouse: left drag orbits, right/middle drag pans, wheel zooms. Load OBJ for mesh editing or PLY for Gaussian splats. Press E for edit mode, H toggles vertex handles, G toggles mesh grid, then click a vertex and drag it in the camera plane. Delete resets selected vertex. F/R resets view. 1/2/3 switch material/depth/normal shader modes.",
+                        Text = "Mouse: left drag orbits, right/middle drag pans, wheel zooms. Load OBJ for mesh editing or PLY/SOG for Gaussian splats. Press E for edit mode, H toggles vertex handles, G toggles mesh grid, then click a vertex and drag it in the camera plane. Delete resets selected vertex. F/R resets view. 1/2/3 switch material/depth/normal shader modes.",
                         TextWrapping = TextWrapping.Wrap,
                         Foreground = Solid(0xFF9DAEC4)
                     }
@@ -209,6 +209,8 @@ public sealed partial class MainPage : Page
         {
             var picker = new FileOpenPicker();
             picker.FileTypeFilter.Add(".ply");
+            picker.FileTypeFilter.Add(".sog");
+            picker.FileTypeFilter.Add(".json");
             var file = await picker.PickSingleFileAsync();
             if (file is null)
             {
@@ -221,24 +223,29 @@ public sealed partial class MainPage : Page
             }
             else
             {
-                _status.Text = "PLY load failed: Uno file picker did not provide a local path for streaming binary Gaussian splats.";
+                _status.Text = "Splat load failed: Uno file picker did not provide a local path for streaming Gaussian splats.";
             }
         }
         catch (Exception ex)
         {
-            _status.Text = $"PLY load failed: {ex.Message}";
+            _status.Text = $"Splat load failed: {ex.Message}";
         }
     }
 
     private void TryLoadStartupModel()
     {
-        var splatPath = Environment.GetEnvironmentVariable("MESHMODELER_PLY");
+        var splatPath = Environment.GetEnvironmentVariable("MESHMODELER_SOG");
+        if (string.IsNullOrWhiteSpace(splatPath))
+        {
+            splatPath = Environment.GetEnvironmentVariable("MESHMODELER_PLY");
+        }
+
         if (string.IsNullOrWhiteSpace(splatPath))
         {
             splatPath = Environment.GetEnvironmentVariable("MESHMODELER_SPLAT");
         }
 
-        if (!string.IsNullOrWhiteSpace(splatPath) && File.Exists(splatPath))
+        if (!string.IsNullOrWhiteSpace(splatPath) && (File.Exists(splatPath) || Directory.Exists(splatPath)))
         {
             try
             {
@@ -247,7 +254,7 @@ public sealed partial class MainPage : Page
             }
             catch (Exception ex)
             {
-                _status.Text = $"Startup PLY load failed: {ex.Message}";
+                _status.Text = $"Startup splat load failed: {ex.Message}";
                 return;
             }
         }

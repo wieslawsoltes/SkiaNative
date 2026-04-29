@@ -10,6 +10,7 @@
     <ApplicationVersion>1</ApplicationVersion>
     <ApplicationPublisher>SkiaNative.Avalonia</ApplicationPublisher>
     <Description>Uno Platform 3D modeling and OBJ editing sample for the SkiaSharp v4 PR 3779 SKMesh API.</Description>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 
     <UnoFeatures>
       CSharpMarkup;
