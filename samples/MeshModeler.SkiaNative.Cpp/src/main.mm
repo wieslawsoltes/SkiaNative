@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
@@ -122,6 +123,11 @@ struct RenderStats {
     size_t vertexCount = 0;
     size_t vertexBytes = 0;
     int drawMeshCalls = 0;
+    bool cacheHit = false;
+    double projectMs = 0.0;
+    double sortMs = 0.0;
+    double uploadMs = 0.0;
+    double cpuMs = 0.0;
 };
 
 enum class DragMode {
@@ -148,6 +154,8 @@ struct SplatVertex {
 static_assert(sizeof(ScreenVertex) == 12);
 static_assert(sizeof(SplatVertex) == 24);
 
+using Clock = std::chrono::steady_clock;
+
 float Clamp(float value, float minValue, float maxValue) {
     return std::max(minValue, std::min(maxValue, value));
 }
@@ -166,6 +174,14 @@ uint32_t PackRgba(Color4 color) {
     const uint32_t b = ToByte(color.b);
     const uint32_t a = ToByte(color.a);
     return r | (g << 8) | (b << 16) | (a << 24);
+}
+
+double MillisecondsBetween(Clock::time_point start, Clock::time_point end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+float LengthSquared(Vec2 value) {
+    return value.x * value.x + value.y * value.y;
 }
 
 Vec3 operator+(Vec3 a, Vec3 b) {
@@ -1549,6 +1565,7 @@ public:
             scene_ = LoadScene(std::filesystem::path(path));
             meshBuffer_ = nullptr;
             meshBufferSize_ = 0;
+            invalidateSplatCache();
             status_ = "Loaded " + path;
             updateSummary();
             return true;
@@ -1593,6 +1610,11 @@ public:
         renderStats_.drawMeshCalls = 0;
         renderStats_.vertexBytes = 0;
         renderStats_.vertexCount = 0;
+        renderStats_.cacheHit = false;
+        renderStats_.projectMs = 0.0;
+        renderStats_.sortMs = 0.0;
+        renderStats_.uploadMs = 0.0;
+        renderStats_.cpuMs = 0.0;
 
         if (!context) {
             status_ = "No GrDirectContext.";
@@ -1617,7 +1639,10 @@ private:
 
     struct SplatDrawItem {
         float z = 0.0f;
-        SplatVertex vertices[6];
+        Vec2 center;
+        Vec2 axis0;
+        Vec2 axis1;
+        uint32_t color = 0;
     };
 
     static constexpr const char* kMeshVertexShader = R"(
@@ -1807,6 +1832,23 @@ float2 main(const Varyings v, out half4 color) {
             return;
         }
 
+        SkPaint paint;
+        paint.setAntiAlias(false);
+        paint.setColor(SK_ColorWHITE);
+
+        if (splatCacheMatches(width, height) && cachedSplatMesh_.isValid()) {
+            canvas->drawMesh(cachedSplatMesh_, nullptr, paint);
+            renderStats_.mode = "GPU-backed cached SkMesh Gaussian splats";
+            renderStats_.primitiveCount = cachedSplatPrimitiveCount_;
+            renderStats_.vertexCount = cachedSplatVertexCount_;
+            renderStats_.vertexBytes = cachedSplatVertexBytes_;
+            renderStats_.drawMeshCalls = 1;
+            renderStats_.cacheHit = true;
+            return;
+        }
+
+        const auto totalStart = Clock::now();
+        const auto projectStart = totalStart;
         const float scale = static_cast<float>(std::min(width, height)) * 0.42f * cameraZoom_;
         const Vec2 center = {width * 0.5f + cameraPan_.x, height * 0.52f + cameraPan_.y};
         const float yaw = cameraYaw_;
@@ -1817,21 +1859,18 @@ float2 main(const Varyings v, out half4 color) {
         splatDrawItems_.reserve(scene_.splats.size());
         for (const auto& splat : scene_.splats) {
             const Vec3 center3 = RotateYThenX(splat.position, yaw, pitch);
-            std::array<Vec2, 3> axes = {{
+            Vec2 axis0;
+            Vec2 axis1;
+            selectLongestAxes(
                 ProjectAxis(RotateYThenX(splat.axis0, yaw, pitch), scale),
                 ProjectAxis(RotateYThenX(splat.axis1, yaw, pitch), scale),
                 ProjectAxis(RotateYThenX(splat.axis2, yaw, pitch), scale),
-            }};
-            std::sort(axes.begin(), axes.end(), [](Vec2 a, Vec2 b) {
-                return a.x * a.x + a.y * a.y > b.x * b.x + b.y * b.y;
-            });
-
-            Vec2 axis0 = axes[0];
-            Vec2 axis1 = axes[1];
-            if (axis0.x * axis0.x + axis0.y * axis0.y < 0.25f) {
+                axis0,
+                axis1);
+            if (LengthSquared(axis0) < 0.25f) {
                 axis0 = {1.0f, 0.0f};
             }
-            if (axis1.x * axis1.x + axis1.y * axis1.y < 0.25f) {
+            if (LengthSquared(axis1) < 0.25f) {
                 axis1 = {0.0f, 1.0f};
             }
 
@@ -1842,63 +1881,143 @@ float2 main(const Varyings v, out half4 color) {
             axis1.y *= extent;
 
             const Vec2 c = {center.x + center3.x * scale, center.y - center3.y * scale};
-            const uint32_t packed = PackRgba(splat.color);
-            auto makeVertex = [&](float lx, float ly) -> SplatVertex {
-                return {
-                    c.x + axis0.x * lx + axis1.x * ly,
-                    c.y + axis0.y * lx + axis1.y * ly,
-                    lx,
-                    ly,
-                    packed,
-                    0u,
-                };
-            };
-
-            SplatDrawItem item;
-            item.z = center3.z;
-            item.vertices[0] = makeVertex(-1.0f, -1.0f);
-            item.vertices[1] = makeVertex( 1.0f, -1.0f);
-            item.vertices[2] = makeVertex( 1.0f,  1.0f);
-            item.vertices[3] = makeVertex(-1.0f, -1.0f);
-            item.vertices[4] = makeVertex( 1.0f,  1.0f);
-            item.vertices[5] = makeVertex(-1.0f,  1.0f);
-            splatDrawItems_.push_back(item);
+            splatDrawItems_.push_back({center3.z, c, axis0, axis1, PackRgba(splat.color)});
         }
+        const auto projectEnd = Clock::now();
 
+        const auto sortStart = Clock::now();
         std::sort(splatDrawItems_.begin(), splatDrawItems_.end(), [](const SplatDrawItem& a, const SplatDrawItem& b) {
             return a.z < b.z;
         });
+        const auto sortEnd = Clock::now();
 
-        splatVertices_.clear();
-        splatVertices_.reserve(splatDrawItems_.size() * 6u);
+        splatVertices_.resize(splatDrawItems_.size() * 6u);
+        size_t vertexOffset = 0;
         for (const auto& item : splatDrawItems_) {
-            for (const auto& vertex : item.vertices) {
-                splatVertices_.push_back(vertex);
-            }
+            writeSplatVertices(item, vertexOffset);
+            vertexOffset += 6u;
         }
 
-        if (!uploadVertices(context, splatVertices_)) {
+        const auto uploadStart = Clock::now();
+        if (!uploadSplatVertices(context)) {
             status_ = "Could not upload Gaussian splat vertices.";
+            invalidateSplatCache();
             return;
         }
 
         SkRect bounds = SkRect::MakeWH(static_cast<float>(width), static_cast<float>(height));
-        SkMesh::Result result = SkMesh::Make(splatSpec_, SkMesh::Mode::kTriangles, meshBuffer_, splatVertices_.size(), 0, nullptr, {}, bounds);
+        SkMesh::Result result = SkMesh::Make(splatSpec_, SkMesh::Mode::kTriangles, splatBuffer_, splatVertices_.size(), 0, nullptr, {}, bounds);
         if (!result.mesh.isValid()) {
             status_ = "SkMesh splat creation failed: " + std::string(result.error.c_str());
+            invalidateSplatCache();
             return;
         }
+        const auto uploadEnd = Clock::now();
 
-        SkPaint paint;
-        paint.setAntiAlias(false);
-        paint.setColor(SK_ColorWHITE);
-        canvas->drawMesh(result.mesh, nullptr, paint);
+        cachedSplatMesh_ = result.mesh;
+        cachedSplatPrimitiveCount_ = scene_.splats.size();
+        cachedSplatVertexCount_ = splatVertices_.size();
+        cachedSplatVertexBytes_ = splatVertices_.size() * sizeof(SplatVertex);
+        storeSplatCacheKey(width, height);
 
-        renderStats_.mode = "GPU-backed SkMesh Gaussian splats";
-        renderStats_.primitiveCount = scene_.splats.size();
-        renderStats_.vertexCount = splatVertices_.size();
-        renderStats_.vertexBytes = splatVertices_.size() * sizeof(SplatVertex);
+        canvas->drawMesh(cachedSplatMesh_, nullptr, paint);
+
+        const auto totalEnd = Clock::now();
+        renderStats_.mode = "GPU-backed cached SkMesh Gaussian splats";
+        renderStats_.primitiveCount = cachedSplatPrimitiveCount_;
+        renderStats_.vertexCount = cachedSplatVertexCount_;
+        renderStats_.vertexBytes = cachedSplatVertexBytes_;
         renderStats_.drawMeshCalls = 1;
+        renderStats_.cacheHit = false;
+        renderStats_.projectMs = MillisecondsBetween(projectStart, projectEnd);
+        renderStats_.sortMs = MillisecondsBetween(sortStart, sortEnd);
+        renderStats_.uploadMs = MillisecondsBetween(uploadStart, uploadEnd);
+        renderStats_.cpuMs = MillisecondsBetween(totalStart, totalEnd);
+    }
+
+    bool uploadSplatVertices(GrDirectContext* context) {
+        const size_t byteSize = splatVertices_.size() * sizeof(SplatVertex);
+        if (byteSize == 0) {
+            return false;
+        }
+        if (!splatBuffer_ || splatBufferSize_ != byteSize) {
+            splatBuffer_ = SkMeshes::MakeVertexBuffer(context, splatVertices_.data(), byteSize);
+            splatBufferSize_ = byteSize;
+            return splatBuffer_ != nullptr;
+        }
+        return splatBuffer_->update(context, splatVertices_.data(), 0, byteSize);
+    }
+
+    void selectLongestAxes(Vec2 a, Vec2 b, Vec2 c, Vec2& axis0, Vec2& axis1) const {
+        axis0 = a;
+        axis1 = b;
+        float length0 = LengthSquared(axis0);
+        float length1 = LengthSquared(axis1);
+        if (length1 > length0) {
+            std::swap(axis0, axis1);
+            std::swap(length0, length1);
+        }
+
+        const float length2 = LengthSquared(c);
+        if (length2 > length0) {
+            axis1 = axis0;
+            axis0 = c;
+        } else if (length2 > length1) {
+            axis1 = c;
+        }
+    }
+
+    void writeSplatVertices(const SplatDrawItem& item, size_t offset) {
+        auto makeVertex = [&](float lx, float ly) -> SplatVertex {
+            return {
+                item.center.x + item.axis0.x * lx + item.axis1.x * ly,
+                item.center.y + item.axis0.y * lx + item.axis1.y * ly,
+                lx,
+                ly,
+                item.color,
+                0u,
+            };
+        };
+
+        splatVertices_[offset + 0] = makeVertex(-1.0f, -1.0f);
+        splatVertices_[offset + 1] = makeVertex( 1.0f, -1.0f);
+        splatVertices_[offset + 2] = makeVertex( 1.0f,  1.0f);
+        splatVertices_[offset + 3] = makeVertex(-1.0f, -1.0f);
+        splatVertices_[offset + 4] = makeVertex( 1.0f,  1.0f);
+        splatVertices_[offset + 5] = makeVertex(-1.0f,  1.0f);
+    }
+
+    bool splatCacheMatches(int width, int height) const {
+        constexpr float epsilon = 0.0001f;
+        return splatCacheValid_ &&
+            splatCacheWidth_ == width &&
+            splatCacheHeight_ == height &&
+            std::abs(splatCacheYaw_ - cameraYaw_) < epsilon &&
+            std::abs(splatCachePitch_ - cameraPitch_) < epsilon &&
+            std::abs(splatCacheZoom_ - cameraZoom_) < epsilon &&
+            std::abs(splatCachePanX_ - cameraPan_.x) < epsilon &&
+            std::abs(splatCachePanY_ - cameraPan_.y) < epsilon;
+    }
+
+    void storeSplatCacheKey(int width, int height) {
+        splatCacheValid_ = true;
+        splatCacheWidth_ = width;
+        splatCacheHeight_ = height;
+        splatCacheYaw_ = cameraYaw_;
+        splatCachePitch_ = cameraPitch_;
+        splatCacheZoom_ = cameraZoom_;
+        splatCachePanX_ = cameraPan_.x;
+        splatCachePanY_ = cameraPan_.y;
+    }
+
+    void invalidateSplatCache() {
+        splatCacheValid_ = false;
+        cachedSplatMesh_ = SkMesh();
+        cachedSplatPrimitiveCount_ = 0;
+        cachedSplatVertexCount_ = 0;
+        cachedSplatVertexBytes_ = 0;
+        splatBuffer_ = nullptr;
+        splatBufferSize_ = 0;
     }
 
     Vec2 ProjectAxis(Vec3 axis, float scale) const {
@@ -1926,11 +2045,11 @@ float2 main(const Varyings v, out half4 color) {
     void drawHud(SkCanvas* canvas, int width, int height) {
         SkPaint panelPaint;
         panelPaint.setColor(SkColorSetARGB(238, 236, 242, 248));
-        canvas->drawRect(SkRect::MakeXYWH(14.0f, 14.0f, std::min(720.0f, width - 28.0f), 196.0f), panelPaint);
+        canvas->drawRect(SkRect::MakeXYWH(14.0f, 14.0f, std::min(780.0f, width - 28.0f), 220.0f), panelPaint);
 
         SkPaint accentPaint;
         accentPaint.setColor(SkColorSetRGB(38, 92, 132));
-        canvas->drawRect(SkRect::MakeXYWH(14.0f, 14.0f, 4.0f, 196.0f), accentPaint);
+        canvas->drawRect(SkRect::MakeXYWH(14.0f, 14.0f, 4.0f, 220.0f), accentPaint);
 
         sk_sp<SkTypeface> hudTypeface = HudTypeface();
         SkFont titleFont(hudTypeface, 18.0f);
@@ -1966,14 +2085,21 @@ float2 main(const Varyings v, out half4 color) {
             "   Resources " + std::to_string(frameStats_.gpuResourceCount);
         canvas->drawString(gpuLine.c_str(), 28.0f, 160.0f, metricFont, textPaint);
 
+        const std::string cpuLine = std::string("Splat cache ") + (renderStats_.cacheHit ? "hit" : "miss") +
+            "   CPU " + FormatFixed(renderStats_.cpuMs, 2) + " ms" +
+            "   project " + FormatFixed(renderStats_.projectMs, 2) +
+            "   sort " + FormatFixed(renderStats_.sortMs, 2) +
+            "   upload " + FormatFixed(renderStats_.uploadMs, 2);
+        canvas->drawString(cpuLine.c_str(), 28.0f, 184.0f, metricFont, textPaint);
+
         const std::string cameraLine = "Camera yaw " + FormatFixed(cameraYaw_ * 180.0 / kPi, 0) +
             " pitch " + FormatFixed(cameraPitch_ * 180.0 / kPi, 0) +
             " zoom " + FormatFixed(cameraZoom_, 2) +
             " pan " + FormatFixed(cameraPan_.x, 0) + "," + FormatFixed(cameraPan_.y, 0);
-        canvas->drawString(cameraLine.c_str(), 28.0f, 184.0f, metricFont, textPaint);
+        canvas->drawString(cameraLine.c_str(), 28.0f, 208.0f, metricFont, textPaint);
 
         textPaint.setColor(SkColorSetRGB(54, 72, 88));
-        canvas->drawString("Left drag orbit, right/middle drag pan, wheel zoom, F/R reset, File > Open or drop OBJ/PLY/SOG/SOB", 28.0f, 204.0f, bodyFont, textPaint);
+        canvas->drawString("Left drag orbit, right/middle drag pan, wheel zoom, F/R reset, File > Open or drop OBJ/PLY/SOG/SOB", 28.0f, 228.0f, bodyFont, textPaint);
 
         (void)height;
     }
@@ -2002,6 +2128,20 @@ float2 main(const Varyings v, out half4 color) {
     sk_sp<SkMeshSpecification> splatSpec_;
     sk_sp<SkMesh::VertexBuffer> meshBuffer_;
     size_t meshBufferSize_ = 0;
+    sk_sp<SkMesh::VertexBuffer> splatBuffer_;
+    size_t splatBufferSize_ = 0;
+    SkMesh cachedSplatMesh_;
+    bool splatCacheValid_ = false;
+    int splatCacheWidth_ = 0;
+    int splatCacheHeight_ = 0;
+    float splatCacheYaw_ = 0.0f;
+    float splatCachePitch_ = 0.0f;
+    float splatCacheZoom_ = 0.0f;
+    float splatCachePanX_ = 0.0f;
+    float splatCachePanY_ = 0.0f;
+    size_t cachedSplatPrimitiveCount_ = 0;
+    size_t cachedSplatVertexCount_ = 0;
+    size_t cachedSplatVertexBytes_ = 0;
     std::vector<DrawTriangle> drawTriangles_;
     std::vector<SplatDrawItem> splatDrawItems_;
     std::vector<ScreenVertex> meshVertices_;
