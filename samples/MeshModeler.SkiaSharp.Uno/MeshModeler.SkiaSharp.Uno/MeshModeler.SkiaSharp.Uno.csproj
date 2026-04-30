@@ -22,6 +22,11 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\MeshModeler.Core\MeshModeler.Core.csproj" />
+    <ProjectReference Include="..\MeshModeler.SkiaSharp.Rendering\MeshModeler.SkiaSharp.Rendering.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="SkiaSharp" />
     <PackageReference Include="SkiaSharp.NativeAssets.macOS" Condition="$([MSBuild]::IsOSPlatform('OSX'))" />
   </ItemGroup>
